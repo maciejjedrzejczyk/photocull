@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""
+photo_quality - scan a photo archive and flag low-quality images for cleanup.
+
+For every image it computes a set of quality metrics and an overall
+recommendation (keep / review / delete) so you can reclaim disk space by
+deleting blurry, dark, dull or junk photos.
+
+Signals
+-------
+Classical (fast, deterministic, computed from pixels):
+  * sharpness  - variance of the Laplacian. Low = blurry / out of focus.
+  * brightness - mean luminance (0-255). Low = too dark.
+  * contrast   - luminance standard deviation. Low = flat / dull / foggy.
+  * noise      - Immerkaer sigma estimate on a native-res crop. High = grainy.
+  * clipping   - fraction of pure-black / pure-white pixels (bad exposure).
+
+Apple Vision (on-device ML, no network):
+  * aesthetics - VNCalculateImageAestheticsScoresRequest.overallScore (~-1..1).
+  * is_utility - Vision's flag for "utility" shots (screenshots, receipts,
+                 documents) rather than memorable photos.
+  * face_quality - VNDetectFaceCaptureQualityRequest, the worst face capture
+                 quality in the frame (low = blurry/badly captured portrait).
+
+Decoding goes through Quartz/ImageIO (CGImageSource), so HEIC/HEIF from an
+Apple photo library is supported alongside JPEG/PNG/TIFF/etc.
+
+SAFETY: this tool never deletes anything. It writes a CSV report and, only if
+you ask with --quarantine, *moves* flagged files into a folder for you to
+review and delete yourself.
+
+Usage
+-----
+    python photo_quality.py ~/Pictures -r
+    python photo_quality.py ~/Pictures -r -o report.csv
+    python photo_quality.py ~/Pictures -r --quarantine ~/Pictures/_rejects
+    python photo_quality.py photo.heic            # inspect a single file
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+import shutil
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field, asdict
+from functools import partial
+from pathlib import Path
+
+import numpy as np
+
+import objc
+import Quartz
+import Vision
+from Foundation import NSURL
+
+
+# Image formats we scan for inside directories. Explicitly-named files are
+# processed regardless of extension.
+IMAGE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff",
+    ".webp", ".heic", ".heif", ".dng",
+}
+
+# Resolution we normalize to before measuring sharpness/brightness/contrast so
+# the numbers are comparable across images of different sizes.
+ANALYSIS_LONGEST_EDGE = 1024
+
+# Size of the native-resolution centre crop used for the noise estimate
+# (downscaling destroys grain, so noise must be measured at full res).
+NOISE_CROP = 768
+
+
+class DecodeError(RuntimeError):
+    pass
+
+
+# Bump when the meaning of any cached metric/feature-print changes, so stale
+# cache rows are recomputed automatically.
+METRICS_VERSION = 1
+
+
+# --------------------------------------------------------------------------
+# Default thresholds. All overridable from the CLI; see README for tuning.
+# --------------------------------------------------------------------------
+@dataclass
+class Thresholds:
+    blur: float = 100.0          # sharpness below this -> "blurry"
+    blur_hard: float = 35.0      # sharpness below this -> "very blurry"
+    dark: float = 50.0           # mean luminance below this -> "dark"
+    dark_hard: float = 25.0      # mean luminance below this -> "very dark"
+    contrast: float = 18.0       # luminance std below this -> "low_contrast"
+    noise: float = 7.0           # noise sigma above this -> "noisy"
+    aesthetic: float = -0.10     # Vision overallScore below this -> "low_aesthetic"
+    clip: float = 0.55           # >55% of pixels black or white -> bad exposure
+
+
+@dataclass
+class Metrics:
+    path: str
+    width: int = 0
+    height: int = 0
+    megapixels: float = 0.0
+    file_bytes: int = 0
+    sharpness: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    noise: float = 0.0
+    black_frac: float = 0.0
+    white_frac: float = 0.0
+    aesthetic: float | None = None
+    is_utility: bool | None = None
+    face_quality: float | None = None
+    recommendation: str = "keep"
+    reasons: list[str] = field(default_factory=list)
+    error: str = ""
+    # Near-duplicate clustering (filled in by --dedupe).
+    cluster_id: int = -1
+    cluster_size: int = 1
+    is_keeper: bool = True
+    # Raw Vision feature-print as float32 bytes (768 dims). Not written to CSV;
+    # cached and used for near-duplicate clustering. None unless --dedupe.
+    fprint: bytes | None = None
+
+
+# --------------------------------------------------------------------------
+# Pixel decoding (Quartz / ImageIO -> grayscale numpy)
+# --------------------------------------------------------------------------
+def _load_cgimage(path: str):
+    url = NSURL.fileURLWithPath_(path)
+    src = Quartz.CGImageSourceCreateWithURL(url, None)
+    if src is None:
+        raise DecodeError("could not open image")
+    cg = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+    if cg is None:
+        raise DecodeError("could not decode image")
+    return cg
+
+
+def _cg_to_gray(cg, longest_edge: int | None) -> np.ndarray:
+    """Render a CGImage into a grayscale float64 numpy array.
+
+    If longest_edge is given the image is scaled so its longer side equals it
+    (never upscaled). Returns an (h, w) array of luminance values 0-255.
+    """
+    W = Quartz.CGImageGetWidth(cg)
+    H = Quartz.CGImageGetHeight(cg)
+    if longest_edge:
+        scale = min(1.0, float(longest_edge) / max(W, H))
+    else:
+        scale = 1.0
+    w = max(1, int(round(W * scale)))
+    h = max(1, int(round(H * scale)))
+
+    cs = Quartz.CGColorSpaceCreateDeviceGray()
+    ctx = Quartz.CGBitmapContextCreate(
+        None, w, h, 8, w, cs, Quartz.kCGImageAlphaNone
+    )
+    if ctx is None:
+        raise DecodeError("could not create bitmap context")
+    Quartz.CGContextSetInterpolationQuality(ctx, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(ctx, Quartz.CGRectMake(0, 0, w, h), cg)
+
+    data = Quartz.CGBitmapContextGetData(ctx)
+    if data is None:
+        raise DecodeError("could not read bitmap data")
+    # CGBitmapContextGetData returns an objc.varlist; .as_buffer gives a
+    # readable buffer. astype() copies the data out so it survives ctx release.
+    arr = np.frombuffer(data.as_buffer(w * h), dtype=np.uint8)
+    return arr.reshape(h, w).astype(np.float64)
+
+
+def _native_centre_crop_gray(cg, crop: int) -> np.ndarray:
+    """Grayscale array of a native-resolution centre crop (for noise)."""
+    W = Quartz.CGImageGetWidth(cg)
+    H = Quartz.CGImageGetHeight(cg)
+    cw = min(crop, W)
+    ch = min(crop, H)
+    x = (W - cw) // 2
+    y = (H - ch) // 2
+    rect = Quartz.CGRectMake(x, y, cw, ch)
+    sub = Quartz.CGImageCreateWithImageInRect(cg, rect)
+    if sub is None:
+        return _cg_to_gray(cg, None)
+    return _cg_to_gray(sub, None)
+
+
+# --------------------------------------------------------------------------
+# Classical metrics
+# --------------------------------------------------------------------------
+def _laplacian_variance(g: np.ndarray) -> float:
+    """Variance of the 4-neighbour Laplacian. Low value => blurry."""
+    lap = (
+        -4.0 * g
+        + np.roll(g, 1, 0) + np.roll(g, -1, 0)
+        + np.roll(g, 1, 1) + np.roll(g, -1, 1)
+    )[1:-1, 1:-1]
+    return float(lap.var())
+
+
+def _noise_sigma(g: np.ndarray) -> float:
+    """Immerkaer fast Gaussian-noise standard-deviation estimate (0-255)."""
+    if g.shape[0] < 3 or g.shape[1] < 3:
+        return 0.0
+    m = (
+        4.0 * g
+        - 2.0 * (np.roll(g, 1, 0) + np.roll(g, -1, 0)
+                 + np.roll(g, 1, 1) + np.roll(g, -1, 1))
+        + np.roll(np.roll(g, 1, 0), 1, 1) + np.roll(np.roll(g, 1, 0), -1, 1)
+        + np.roll(np.roll(g, -1, 0), 1, 1) + np.roll(np.roll(g, -1, 0), -1, 1)
+    )[1:-1, 1:-1]
+    h, w = g.shape
+    return float(math.sqrt(math.pi / 2.0) * np.sum(np.abs(m))
+                 / (6.0 * (w - 2) * (h - 2)))
+
+
+def compute_classical(cg, m: Metrics) -> None:
+    g = _cg_to_gray(cg, ANALYSIS_LONGEST_EDGE)
+    m.sharpness = round(_laplacian_variance(g), 1)
+    m.brightness = round(float(g.mean()), 1)
+    m.contrast = round(float(g.std()), 1)
+    total = g.size
+    m.black_frac = round(float(np.count_nonzero(g <= 5)) / total, 3)
+    m.white_frac = round(float(np.count_nonzero(g >= 250)) / total, 3)
+    crop = _native_centre_crop_gray(cg, NOISE_CROP)
+    m.noise = round(_noise_sigma(crop), 2)
+
+
+# --------------------------------------------------------------------------
+# Apple Vision signals
+# --------------------------------------------------------------------------
+def compute_vision(cg, m: Metrics, want_faces: bool, want_fprint: bool) -> None:
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, {})
+
+    aesth = Vision.VNCalculateImageAestheticsScoresRequest.alloc().init()
+    requests = [aesth]
+
+    face_req = None
+    if want_faces:
+        face_req = Vision.VNDetectFaceCaptureQualityRequest.alloc().init()
+        requests.append(face_req)
+
+    fprint_req = None
+    if want_fprint:
+        fprint_req = Vision.VNGenerateImageFeaturePrintRequest.alloc().init()
+        requests.append(fprint_req)
+
+    ok, err = handler.performRequests_error_(requests, None)
+    if not ok:
+        raise DecodeError(f"Vision request failed: {err}")
+
+    for obs in aesth.results() or []:
+        m.aesthetic = round(float(obs.overallScore()), 3)
+        m.is_utility = bool(obs.isUtility())
+        break
+
+    if face_req is not None:
+        qualities = []
+        for obs in face_req.results() or []:
+            q = obs.faceCaptureQuality()
+            if q is not None:
+                qualities.append(float(q))
+        if qualities:
+            # Worst face in the frame is what matters for "is this a keeper".
+            m.face_quality = round(min(qualities), 3)
+
+    if fprint_req is not None:
+        for obs in fprint_req.results() or []:
+            m.fprint = _fprint_bytes(obs)
+            break
+
+
+def _fprint_bytes(obs) -> bytes | None:
+    """Extract a VNFeaturePrintObservation as raw float32 bytes."""
+    data = obs.data()
+    if data is None:
+        return None
+    raw = data.bytes().tobytes() if hasattr(data, "bytes") else bytes(data)
+    # Feature prints are float32; keep only that (defensive against padding).
+    n = (len(raw) // 4) * 4
+    return raw[:n]
+
+
+# --------------------------------------------------------------------------
+# Verdict
+# --------------------------------------------------------------------------
+def decide(m: Metrics, t: Thresholds) -> None:
+    reasons: list[str] = []
+
+    very_blurry = m.sharpness < t.blur_hard
+    blurry = m.sharpness < t.blur
+    very_dark = m.brightness < t.dark_hard
+    dark = m.brightness < t.dark
+    bad_exposure = (m.black_frac >= t.clip) or (m.white_frac >= t.clip)
+
+    if blurry:
+        reasons.append("very_blurry" if very_blurry else "blurry")
+    if dark:
+        reasons.append("very_dark" if very_dark else "dark")
+    if m.contrast < t.contrast:
+        reasons.append("low_contrast")
+    if m.noise > t.noise:
+        reasons.append("noisy")
+    if bad_exposure:
+        reasons.append("bad_exposure")
+    if m.aesthetic is not None and m.aesthetic < t.aesthetic:
+        reasons.append("low_aesthetic")
+    if m.is_utility:
+        reasons.append("utility")
+
+    # Recommendation tiers.
+    #   delete  - strong, objective defect: clearly blurry or clearly dark, or
+    #             a face shot Vision rates as a poor capture.
+    #   review  - milder/subjective issues worth a human glance.
+    #   keep    - no flags.
+    strong = (
+        very_blurry
+        or very_dark
+        or (blurry and (dark or bad_exposure or m.contrast < t.contrast))
+        or (m.face_quality is not None and m.face_quality < 0.30)
+    )
+    if strong:
+        m.recommendation = "delete"
+    elif reasons:
+        m.recommendation = "review"
+    else:
+        m.recommendation = "keep"
+    m.reasons = reasons
+
+
+# --------------------------------------------------------------------------
+# Per-file analysis
+# --------------------------------------------------------------------------
+def analyse(path: Path, use_vision: bool, want_faces: bool,
+            want_fprint: bool) -> Metrics:
+    m = Metrics(path=str(path))
+    try:
+        st = path.stat()
+        m.file_bytes = st.st_size
+    except OSError:
+        pass
+    # Drain Objective-C autoreleased objects (CGImages, bitmap contexts, NSData
+    # buffers, Vision result arrays) after every image. Without this they
+    # accumulate for the life of the process, leaking memory and steadily
+    # slowing the scan down on large libraries.
+    try:
+        with objc.autorelease_pool():
+            cg = _load_cgimage(str(path))
+            m.width = Quartz.CGImageGetWidth(cg)
+            m.height = Quartz.CGImageGetHeight(cg)
+            m.megapixels = round(m.width * m.height / 1e6, 2)
+            compute_classical(cg, m)
+            if use_vision:
+                compute_vision(cg, m, want_faces, want_fprint)
+    except (DecodeError, Exception) as e:  # noqa: BLE001 - report & continue
+        m.error = str(e)
+        m.recommendation = "error"
+    return m
+
+
+# --------------------------------------------------------------------------
+# Input discovery
+# --------------------------------------------------------------------------
+def collect_inputs(paths, recursive: bool, skip_dir: Path | None):
+    files, missing, seen = [], [], set()
+
+    def add(p: Path):
+        key = p.resolve()
+        if key not in seen:
+            seen.add(key)
+            files.append(p)
+
+    skip_resolved = skip_dir.resolve() if skip_dir else None
+
+    def under_skip(p: Path) -> bool:
+        if skip_resolved is None:
+            return False
+        try:
+            p.resolve().relative_to(skip_resolved)
+            return True
+        except ValueError:
+            return False
+
+    for path in paths:
+        if not path.exists():
+            missing.append(path)
+        elif path.is_dir():
+            pattern = "**/*" if recursive else "*"
+            for entry in sorted(path.glob(pattern)):
+                if (entry.is_file()
+                        and entry.suffix.lower() in IMAGE_EXTS
+                        and not under_skip(entry)):
+                    add(entry)
+        else:
+            add(path)
+    return files, missing
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+CSV_FIELDS = [
+    "path", "recommendation", "reasons", "sharpness", "brightness",
+    "contrast", "noise", "black_frac", "white_frac", "aesthetic",
+    "is_utility", "face_quality", "cluster_id", "cluster_size", "is_keeper",
+    "width", "height", "megapixels", "file_bytes", "error",
+]
+
+
+def write_csv(results: list[Metrics], out_path: Path) -> None:
+    with out_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        for m in results:
+            row = asdict(m)
+            row["reasons"] = ";".join(m.reasons)
+            w.writerow({k: row.get(k, "") for k in CSV_FIELDS})
+
+
+def _human_bytes(n: int) -> str:
+    step = 1024.0
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < step:
+            return f"{n:.1f} {unit}"
+        n /= step
+    return f"{n:.1f} PB"
+
+
+def print_summary(results: list[Metrics], dd_stats: dict | None = None) -> None:
+    tiers = {"delete": [], "duplicate": [], "review": [], "keep": [], "error": []}
+    for m in results:
+        tiers.setdefault(m.recommendation, []).append(m)
+
+    total = len(results)
+    print("\n" + "=" * 60)
+    print(f"Scanned {total} image(s)")
+    print("-" * 60)
+    for tier in ("delete", "duplicate", "review", "keep", "error"):
+        items = tiers.get(tier, [])
+        if not items:
+            continue
+        size = sum(m.file_bytes for m in items)
+        print(f"  {tier:9s}: {len(items):6d}  ({_human_bytes(size)})")
+
+    if dd_stats and dd_stats.get("clusters"):
+        print("-" * 60)
+        print(f"Near-duplicate groups: {dd_stats['clusters']}  "
+              f"(keeping the best of each)")
+        print(f"Redundant copies flagged: {dd_stats['redundant']}  "
+              f"-> {_human_bytes(dd_stats['reclaim'])} reclaimable")
+
+    delete = tiers.get("delete", [])
+    if delete:
+        reclaim = sum(m.file_bytes for m in delete)
+        print("-" * 60)
+        print(f"Reclaimable from low-quality 'delete' candidates: "
+              f"{_human_bytes(reclaim)}")
+
+        counts: dict[str, int] = {}
+        for m in delete:
+            for r in m.reasons:
+                counts[r] = counts.get(r, 0) + 1
+        if counts:
+            tally = ", ".join(f"{k}={v}" for k, v in
+                              sorted(counts.items(), key=lambda kv: -kv[1]))
+            print(f"Delete reasons: {tally}")
+
+    grand = sum(m.file_bytes for m in tiers.get("delete", [])) \
+        + sum(m.file_bytes for m in tiers.get("duplicate", []))
+    if grand:
+        print("-" * 60)
+        print(f"Total reclaimable (delete + duplicate): {_human_bytes(grand)}")
+    print("=" * 60)
+
+
+def quarantine(results: list[Metrics], dest: Path, tiers: set[str],
+               roots: list[Path], dry_run: bool) -> None:
+    """Move flagged files into dest, preserving structure. Never deletes."""
+    moved = 0
+    if not dry_run:
+        dest.mkdir(parents=True, exist_ok=True)
+    for m in results:
+        if m.recommendation not in tiers:
+            continue
+        src = Path(m.path)
+        if not src.exists():
+            continue
+        # Try to preserve a meaningful relative path under one of the roots.
+        rel = None
+        for root in roots:
+            try:
+                rel = src.resolve().relative_to(root.resolve())
+                break
+            except ValueError:
+                continue
+        target = dest / (rel if rel else src.name)
+        if dry_run:
+            print(f"[dry-run] would move {src} -> {target}")
+            moved += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Avoid clobbering existing files in the quarantine.
+        if target.exists():
+            stem, suf = target.stem, target.suffix
+            i = 1
+            while target.exists():
+                target = target.with_name(f"{stem}__{i}{suf}")
+                i += 1
+        shutil.move(str(src), str(target))
+        moved += 1
+    verb = "would move" if dry_run else "moved"
+    print(f"Quarantine: {verb} {moved} file(s) -> {dest}")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def _default_workers() -> int:
+    """A sensible default: leave a couple of cores for the OS / Vision."""
+    cpu = os.cpu_count() or 1
+    return max(1, min(8, cpu - 2))
+
+
+def _progress(done: int, total: int, t0: float) -> None:
+    if done % 50 == 0 or done == total:
+        rate = done / max(1e-6, time.time() - t0)
+        eta = (total - done) / rate if rate else 0
+        print(f"  {done}/{total}  ({rate:.1f}/s, eta {eta/60:.1f} min)",
+              file=sys.stderr)
+
+
+def run_analysis(files, use_vision: bool, want_faces: bool, want_fprint: bool,
+                 workers: int, done0: int = 0, total0: int = 0) -> list[Metrics]:
+    """Analyse every file, serially or across worker processes.
+
+    Each image is wrapped in its own autorelease pool inside analyse(), so
+    memory stays flat regardless of library size. Parallelism is process-based
+    (not threads) to sidestep the GIL and pyobjc thread-safety concerns.
+    """
+    task = partial(analyse, use_vision=use_vision, want_faces=want_faces,
+                   want_fprint=want_fprint)
+    results: list[Metrics] = []
+    t0 = time.time()
+    total = total0 or len(files)
+    done = done0
+
+    if workers <= 1 or len(files) <= 1:
+        for path in files:
+            results.append(task(path))
+            done += 1
+            _progress(done, total, t0)
+        return results
+
+    # chunksize batches files per IPC round-trip to cut overhead.
+    chunksize = max(1, min(16, len(files) // (workers * 8) or 1))
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for m in ex.map(task, files, chunksize=chunksize):
+            results.append(m)
+            done += 1
+            _progress(done, total, t0)
+    return results
+
+
+# --------------------------------------------------------------------------
+# On-disk result cache (SQLite). Stores the *expensive* outputs (decode +
+# Vision metrics + feature print) keyed on (path, size, mtime). The cheap
+# verdict (decide()) is always recomputed, so changing thresholds never
+# requires a rescan. Only the main process touches the DB -> no locking issues.
+# --------------------------------------------------------------------------
+_CACHE_COLS = [
+    "width", "height", "megapixels", "file_bytes", "sharpness", "brightness",
+    "contrast", "noise", "black_frac", "white_frac", "aesthetic",
+    "is_utility", "face_quality",
+]
+
+
+class Cache:
+    def __init__(self, path: Path):
+        import sqlite3
+        self.path = path
+        self.conn = sqlite3.connect(str(path))
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS cache (
+                   path TEXT PRIMARY KEY, size INTEGER, mtime INTEGER, ver INTEGER,
+                   width INTEGER, height INTEGER, megapixels REAL, file_bytes INTEGER,
+                   sharpness REAL, brightness REAL, contrast REAL, noise REAL,
+                   black_frac REAL, white_frac REAL, aesthetic REAL,
+                   is_utility INTEGER, face_quality REAL, fprint BLOB
+               )"""
+        )
+        self.conn.commit()
+
+    def get(self, path: str, size: int, mtime: int,
+            need_fprint: bool) -> Metrics | None:
+        cur = self.conn.execute(
+            "SELECT size, mtime, ver, width, height, megapixels, file_bytes, "
+            "sharpness, brightness, contrast, noise, black_frac, white_frac, "
+            "aesthetic, is_utility, face_quality, fprint FROM cache WHERE path=?",
+            (path,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        if row[0] != size or row[1] != mtime or row[2] != METRICS_VERSION:
+            return None
+        if need_fprint and row[16] is None:
+            return None
+        m = Metrics(path=path)
+        (m.width, m.height, m.megapixels, m.file_bytes, m.sharpness,
+         m.brightness, m.contrast, m.noise, m.black_frac, m.white_frac) = row[3:13]
+        m.aesthetic = row[13]
+        m.is_utility = None if row[14] is None else bool(row[14])
+        m.face_quality = row[15]
+        m.fprint = bytes(row[16]) if row[16] is not None else None
+        return m
+
+    def put_many(self, results: list[Metrics], stat_map: dict) -> None:
+        rows = []
+        for m in results:
+            if m.error:  # don't cache failures; retry them next run
+                continue
+            size, mtime = stat_map.get(m.path, (m.file_bytes, 0))
+            rows.append((
+                m.path, size, mtime, METRICS_VERSION,
+                m.width, m.height, m.megapixels, m.file_bytes,
+                m.sharpness, m.brightness, m.contrast, m.noise,
+                m.black_frac, m.white_frac, m.aesthetic,
+                None if m.is_utility is None else int(m.is_utility),
+                m.face_quality, m.fprint,
+            ))
+        if rows:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO cache VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows,
+            )
+            self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
+# --------------------------------------------------------------------------
+# Near-duplicate / burst clustering via Vision feature prints
+# --------------------------------------------------------------------------
+def _keep_score(m: Metrics):
+    """Higher is a better keeper. Face capture quality (Apple's own best-shot
+    signal) leads when faces are present, then sharpness, then aesthetics and
+    resolution as tie-breakers."""
+    return (
+        0 if m.error else 1,
+        m.face_quality if m.face_quality is not None else -1.0,
+        m.sharpness,
+        m.aesthetic if m.aesthetic is not None else 0.0,
+        m.megapixels,
+        m.file_bytes,
+    )
+
+
+def cluster_near_duplicates(results: list[Metrics], threshold: float) -> dict:
+    """Cluster near-identical photos by feature-print L2 distance.
+
+    Marks every member with a cluster_id/size and is_keeper flag; non-keepers
+    get recommendation 'duplicate'. Returns summary stats. O(n^2) distances are
+    computed with blocked BLAS matrix products, which handles tens of thousands
+    of images in seconds.
+    """
+    have = [i for i, m in enumerate(results) if m.fprint]
+    # All feature prints should be the same length; keep the dominant length.
+    if len(have) >= 2:
+        lengths = [len(results[i].fprint) for i in have]
+        common = max(set(lengths), key=lengths.count)
+        have = [i for i in have if len(results[i].fprint) == common]
+    if len(have) < 2:
+        return {"clusters": 0, "redundant": 0, "reclaim": 0}
+
+    F = np.stack([np.frombuffer(results[i].fprint, dtype=np.float32)
+                  for i in have]).astype(np.float32)
+    n = F.shape[0]
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    sq = (F * F).sum(axis=1)
+    thr2 = float(threshold) ** 2
+    block = 2048
+    for a in range(0, n, block):
+        blk = F[a:a + block]
+        # squared L2: ||x||^2 + ||y||^2 - 2 x.y
+        d2 = sq[a:a + blk.shape[0], None] + sq[None, :] - 2.0 * (blk @ F.T)
+        for r in range(blk.shape[0]):
+            gi = a + r
+            row = d2[r]
+            js = np.nonzero(row[gi + 1:] < thr2)[0]
+            for off in js:
+                union(gi, gi + 1 + int(off))
+
+    groups: dict[int, list[int]] = {}
+    for k in range(n):
+        groups.setdefault(find(k), []).append(k)
+
+    clusters = redundant = reclaim = 0
+    cid = 0
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        ridx = [have[k] for k in members]
+        keeper = max(ridx, key=lambda i: _keep_score(results[i]))
+        keeper_name = Path(results[keeper].path).name
+        for i in ridx:
+            results[i].cluster_id = cid
+            results[i].cluster_size = len(ridx)
+            results[i].is_keeper = (i == keeper)
+            if i != keeper:
+                results[i].recommendation = "duplicate"
+                results[i].reasons = [f"near_dup_of:{keeper_name}"]
+                redundant += 1
+                reclaim += results[i].file_bytes
+        clusters += 1
+        cid += 1
+    return {"clusters": clusters, "redundant": redundant, "reclaim": reclaim}
+
+
+# --------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="photocull",
+        description="Flag blurry/dark/low-quality photos for cleanup "
+                    "(macOS, Apple Vision). Never deletes.",
+    )
+    p.add_argument("paths", nargs="+", type=Path,
+                   help="image file(s) and/or folder(s) to scan")
+    p.add_argument("-r", "--recursive", action="store_true",
+                   help="descend into subfolders")
+    p.add_argument("-o", "--output", type=Path, default=Path("photo_quality_report.csv"),
+                   help="CSV report path (default: photo_quality_report.csv)")
+    p.add_argument("--no-vision", action="store_true",
+                   help="skip Apple Vision (faster; classical metrics only)")
+    p.add_argument("--no-faces", action="store_true",
+                   help="skip per-face capture-quality (a bit faster)")
+    p.add_argument("-j", "--workers", type=int, default=_default_workers(),
+                   help="parallel worker processes (default: %(default)s; "
+                        "use 1 to disable parallelism)")
+
+    dd = p.add_argument_group("near-duplicate detection")
+    dd.add_argument("--dedupe", action="store_true",
+                    help="find near-duplicate/burst photos (Vision feature "
+                         "prints) and flag all but the best in each group")
+    dd.add_argument("--dedupe-threshold", type=float, default=0.3,
+                    help="feature-print L2 distance below which two photos are "
+                         "near-duplicates (default 0.3; lower = stricter/safer, "
+                         "higher risks merging distinct shots of the same scene)")
+
+    c = p.add_argument_group("cache")
+    c.add_argument("--cache", type=Path, default=Path(".photo_quality_cache.sqlite"),
+                   help="result cache DB path (default .photo_quality_cache.sqlite)")
+    c.add_argument("--no-cache", action="store_true",
+                   help="disable the on-disk result cache")
+
+    g = p.add_argument_group("thresholds")
+    d = Thresholds()
+    g.add_argument("--blur", type=float, default=d.blur,
+                   help=f"sharpness below this is blurry (default {d.blur})")
+    g.add_argument("--blur-hard", type=float, default=d.blur_hard,
+                   help=f"sharpness below this is very blurry (default {d.blur_hard})")
+    g.add_argument("--dark", type=float, default=d.dark,
+                   help=f"mean luminance below this is dark (default {d.dark})")
+    g.add_argument("--dark-hard", type=float, default=d.dark_hard,
+                   help=f"mean luminance below this is very dark (default {d.dark_hard})")
+    g.add_argument("--contrast", type=float, default=d.contrast,
+                   help=f"luminance std below this is low-contrast (default {d.contrast})")
+    g.add_argument("--noise", type=float, default=d.noise,
+                   help=f"noise sigma above this is noisy (default {d.noise})")
+    g.add_argument("--aesthetic", type=float, default=d.aesthetic,
+                   help=f"Vision score below this is low-aesthetic (default {d.aesthetic})")
+
+    q = p.add_argument_group("quarantine (optional, moves files; never deletes)")
+    q.add_argument("--quarantine", type=Path, metavar="DIR",
+                   help="move flagged files into DIR for review")
+    q.add_argument("--include-review", action="store_true",
+                   help="also quarantine 'review' tier, not just 'delete'")
+    q.add_argument("--dry-run", action="store_true",
+                   help="with --quarantine, only print what would move")
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    t = Thresholds(
+        blur=args.blur, blur_hard=args.blur_hard, dark=args.dark,
+        dark_hard=args.dark_hard, contrast=args.contrast, noise=args.noise,
+        aesthetic=args.aesthetic,
+    )
+
+    skip_dir = args.quarantine if args.quarantine else None
+    files, missing = collect_inputs(args.paths, args.recursive, skip_dir)
+
+    for p in missing:
+        print(f"skip: {p} (not found)", file=sys.stderr)
+    if not files:
+        print("no image files to process", file=sys.stderr)
+        return 1
+
+    use_vision = not args.no_vision
+    want_faces = use_vision and not args.no_faces
+    want_fprint = args.dedupe and use_vision
+    workers = max(1, args.workers)
+
+    if args.dedupe and not use_vision:
+        print("note: --dedupe needs Vision; ignoring --no-vision for it.",
+              file=sys.stderr)
+        use_vision = True
+        want_fprint = True
+
+    # --- cache split: reuse unchanged files, only compute the rest ----------
+    cache = None
+    if not args.no_cache:
+        try:
+            cache = Cache(args.cache)
+        except Exception as e:  # noqa: BLE001
+            print(f"warning: could not open cache {args.cache}: {e}",
+                  file=sys.stderr)
+
+    stat_map: dict[str, tuple[int, int]] = {}
+    cached: list[Metrics] = []
+    to_compute: list[Path] = []
+    for f in files:
+        sp = str(f)
+        try:
+            st = f.stat()
+            stat_map[sp] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            to_compute.append(f)
+            continue
+        m = (cache.get(sp, st.st_size, st.st_mtime_ns, want_fprint)
+             if cache else None)
+        if m is not None:
+            cached.append(m)
+        else:
+            to_compute.append(f)
+
+    cache_note = (f" | {len(cached)} from cache, {len(to_compute)} to compute"
+                  if cache else "")
+    classical_note = " (classical only)" if not use_vision else ""
+    print(f"Analysing {len(files)} image(s) with {workers} worker(s)"
+          f"{classical_note}{cache_note}...", file=sys.stderr)
+
+    fresh = run_analysis(to_compute, use_vision, want_faces, want_fprint,
+                         workers, done0=len(cached), total0=len(files))
+
+    if cache is not None:
+        cache.put_many(fresh, stat_map)
+        cache.close()
+
+    results = cached + fresh
+
+    # Verdict is recomputed for everything so current thresholds always apply,
+    # even to cached rows.
+    for m in results:
+        if m.recommendation != "error":
+            decide(m, t)
+
+    # Near-duplicate clustering (overrides non-keepers to 'duplicate').
+    dd_stats = None
+    if args.dedupe:
+        print("Clustering near-duplicates...", file=sys.stderr)
+        dd_stats = cluster_near_duplicates(results, args.dedupe_threshold)
+
+    # Sort: worst/most-reclaimable first; blurriest first within a tier.
+    order = {"delete": 0, "duplicate": 1, "review": 2, "keep": 3, "error": 4}
+    results.sort(key=lambda m: (order.get(m.recommendation, 9), m.sharpness))
+
+    write_csv(results, args.output)
+    print(f"\nWrote report: {args.output}", file=sys.stderr)
+    print_summary(results, dd_stats)
+
+    if args.quarantine:
+        roots = [p for p in args.paths if p.is_dir()]
+        tiers = {"delete", "duplicate"} | ({"review"} if args.include_review else set())
+        quarantine(results, args.quarantine, tiers, roots, args.dry_run)
+        if not args.dry_run:
+            print("Files were MOVED (not deleted). Review them, then delete "
+                  "manually when you're sure.", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

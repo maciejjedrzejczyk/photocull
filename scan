@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Convenience launcher for photocull.
+# Creates a local virtualenv with the required dependencies on first run, then
+# forwards all arguments to photo_quality.py.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$HERE/.venv"
+PY="$VENV/bin/python"
+
+if [[ ! -x "$PY" ]]; then
+  echo "First run: creating virtualenv and installing dependencies..." >&2
+  python3 -m venv "$VENV"
+  PY="$VENV/bin/python"
+  "$PY" -m pip install --quiet --upgrade pip
+fi
+
+# Make sure dependencies are present (e.g. after a fresh checkout).
+if ! "$PY" -c "import numpy, Vision, Quartz" >/dev/null 2>&1; then
+  echo "Installing dependencies..." >&2
+  "$PY" -m pip install --quiet -r "$HERE/requirements.txt"
+fi
+
+exec "$PY" "$HERE/photo_quality.py" "$@"

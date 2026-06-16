@@ -1,0 +1,3 @@
+pyobjc-framework-Vision>=12.2
+pyobjc-framework-Quartz>=12.2
+numpy>=2.0
