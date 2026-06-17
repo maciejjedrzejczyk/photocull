@@ -1,7 +1,7 @@
 # photocull
 
-**Find and cull blurry, dark, low-quality and duplicate photos in a macOS
-library — to reclaim disk space, safely.**
+Find and cull blurry, dark, low-quality and duplicate photos in a macOS
+library to reclaim disk space.
 
 ## Overview
 
