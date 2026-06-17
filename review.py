@@ -91,13 +91,13 @@ def make_jpeg(path: str, max_px: int, quality: float = 0.72) -> bytes | None:
         return bytes(data)
 
 
-def cached_jpeg(path: str, max_px: int) -> bytes | None:
-    key = f"{path}@{max_px}"
+def cached_jpeg(path: str, max_px: int, quality: float = 0.85) -> bytes | None:
+    key = f"{path}@{max_px}q{quality}"
     with _LOCK:
         if key in _THUMB_CACHE:
             _THUMB_CACHE.move_to_end(key)
             return _THUMB_CACHE[key]
-    jpg = make_jpeg(path, max_px)
+    jpg = make_jpeg(path, max_px, quality)
     if jpg is None:
         return None
     with _LOCK:
@@ -206,8 +206,11 @@ class Handler(BaseHTTPRequestHandler):
             it = self._item_for(qs)
             if it is None or it["abspath"] not in ALLOWED or it.get("removed"):
                 return self._send(404, b"", "image/jpeg")
-            max_px = 360 if route == "/thumb" else 2200
-            jpg = cached_jpeg(it["abspath"], max_px)
+            if route == "/thumb":
+                max_px, quality = 640, 0.85
+            else:
+                max_px, quality = 2200, 0.85
+            jpg = cached_jpeg(it["abspath"], max_px, quality)
             if jpg is None:
                 return self._send(404, b"", "image/jpeg")
             return self._send(200, jpg, "image/jpeg")
