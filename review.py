@@ -54,6 +54,8 @@ ALLOWED: set[str] = set()       # resolved absolute paths that may be served
 TOKEN = ""                      # per-session anti-CSRF token
 QUARANTINE: Path | None = None  # optional quarantine destination
 QROOTS: list[Path] = []         # roots for preserving structure on quarantine
+ALLOWED_HOSTS: set[str] = {"127.0.0.1", "localhost", "::1", ""}
+ALLOW_ANY_HOST = False          # True when bound to a wildcard address
 _LOCK = threading.Lock()
 
 # Small LRU cache of generated JPEGs: key -> bytes
@@ -152,8 +154,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- helpers -----------------------------------------------------------
     def _localhost_ok(self) -> bool:
-        host = (self.headers.get("Host") or "").split(":")[0]
-        return host in ("127.0.0.1", "localhost", "::1", "")
+        # Reject mismatched Host headers (anti-DNS-rebinding). The allow-list is
+        # localhost plus any explicitly configured --host; a wildcard bind
+        # (0.0.0.0/::) accepts any Host because the user opted to expose it.
+        if ALLOW_ANY_HOST:
+            return True
+        host = (self.headers.get("Host") or "").split(":")[0].strip("[]")
+        return host in ALLOWED_HOSTS
 
     def _send(self, code, body=b"", ctype="application/octet-stream", extra=None):
         if isinstance(body, str):
@@ -522,7 +529,7 @@ $("#sort").onchange=()=>{page=0;render();};
 
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
-    global TOKEN, QUARANTINE, QROOTS
+    global TOKEN, QUARANTINE, QROOTS, ALLOWED_HOSTS, ALLOW_ANY_HOST
     ap = argparse.ArgumentParser(
         prog="photocull-review",
         description="Local web gallery to triage a photocull CSV report "
@@ -532,7 +539,9 @@ def main(argv=None) -> int:
                     help="the photocull CSV report (default photo_quality_report.csv)")
     ap.add_argument("--port", type=int, default=8765, help="port (default 8765)")
     ap.add_argument("--host", default="127.0.0.1",
-                    help="bind address (default 127.0.0.1; keep it local)")
+                    help="bind address (default 127.0.0.1). Binding to a "
+                         "network IP exposes a delete-capable, unauthenticated "
+                         "server -- prefer an SSH tunnel (see docs/review.md).")
     ap.add_argument("--quarantine", type=Path, metavar="DIR",
                     help="enable the Quarantine action, moving files into DIR")
     ap.add_argument("--root", type=Path, action="append", default=[],
@@ -555,6 +564,16 @@ def main(argv=None) -> int:
     QUARANTINE = args.quarantine
     QROOTS = args.root
 
+    # Build the Host-header allow-list. Localhost is always allowed; an explicit
+    # --host is added so direct remote access works. A wildcard bind accepts any
+    # Host (the user has clearly chosen to expose the server).
+    local = {"127.0.0.1", "localhost", "::1"}
+    ALLOWED_HOSTS = local | {""}
+    if args.host not in local:
+        ALLOWED_HOSTS.add(args.host)
+    ALLOW_ANY_HOST = args.host in ("0.0.0.0", "::")
+    remote = args.host not in local
+
     missing = sum(1 for it in ITEMS if not it["exists"])
     print(f"Loaded {len(ITEMS)} rows ({len(ALLOWED)} files present"
           + (f", {missing} missing" if missing else "") + ").", file=sys.stderr)
@@ -565,7 +584,18 @@ def main(argv=None) -> int:
     print(f"\n  photocull review running at  {url}", file=sys.stderr)
     print("  Deletions move files to the macOS Trash (recoverable).",
           file=sys.stderr)
-    print("  Press Ctrl+C to stop.\n", file=sys.stderr)
+    if remote:
+        print("\n  !! SECURITY WARNING ----------------------------------------",
+              file=sys.stderr)
+        print("  This is bound to a NETWORK address, not localhost.", file=sys.stderr)
+        print("  The server is UNAUTHENTICATED: anyone who can reach", file=sys.stderr)
+        print(f"  {args.host}:{args.port} can view your photos AND move them to", file=sys.stderr)
+        print("  the Trash / quarantine. For remote access, prefer an SSH", file=sys.stderr)
+        print("  tunnel and keep the default localhost bind:", file=sys.stderr)
+        print(f"      ssh -L {args.port}:127.0.0.1:{args.port} you@this-mac", file=sys.stderr)
+        print("  ------------------------------------------------------------",
+              file=sys.stderr)
+    print("\n  Press Ctrl+C to stop.\n", file=sys.stderr)
 
     if not args.no_browser:
         import webbrowser

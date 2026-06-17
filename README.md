@@ -1,7 +1,6 @@
 # photocull
 
-Find and cull blurry, dark, low-quality and duplicate photos in a macOS
-library to reclaim disk space.
+Find and cull blurry, dark, low-quality and duplicate photos to reclaim disk space on MacOS.
 
 ## Overview
 
@@ -46,9 +45,16 @@ first run.
 ./scan ~/Pictures -r                                  # recursive scan -> photo_quality_report.csv
 ./scan ~/Pictures -r -o report.csv                    # choose the report path
 ./scan ~/Pictures -r --no-vision                      # classical metrics only (faster)
+./scan ~/Pictures -r -j 8                             # run on 8 worker processes (parallel)
 ./scan ~/Pictures -r --quarantine ~/_rejects --dry-run  # preview moving flagged files
 ./scan ~/Pictures -r --quarantine ~/_rejects          # move them (never deletes)
 ```
+
+**Performance.** photocull runs in parallel across multiple processes. By
+default the worker count is **auto-detected from your CPU's performance cores**
+(and capped when Vision is in play, since Vision shares the Neural Engine).
+Override it with `-j N` (`--workers`) to trade speed against keeping the machine
+responsive. See [docs/performance.md](docs/performance.md) for guidance.
 
 Common options: `-j N` (workers), `--blur`, `--dark`, `--noise`, etc.
 Full list in [docs/options.md](docs/options.md).

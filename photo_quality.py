@@ -44,6 +44,7 @@ import csv
 import math
 import os
 import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -519,10 +520,39 @@ def quarantine(results: list[Metrics], dest: Path, tiers: set[str],
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
-def _default_workers() -> int:
-    """A sensible default: leave a couple of cores for the OS / Vision."""
+def _perf_cores() -> int | None:
+    """Number of performance (P) cores on Apple Silicon, or None elsewhere.
+
+    Efficiency cores are much slower, so basing the worker count on P-cores is
+    a better default than total logical cores.
+    """
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+            capture_output=True, text=True, timeout=1)
+        val = out.stdout.strip()
+        if out.returncode == 0 and val.isdigit() and int(val) > 0:
+            return int(val)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _default_workers(use_vision: bool = True) -> int:
+    """Auto-pick a worker count from host capabilities.
+
+    Uses performance-core count on Apple Silicon (falling back to logical
+    cores minus a couple elsewhere). With Vision enabled the result is capped,
+    because the aesthetics/feature-print passes share the Neural Engine/GPU and
+    stop scaling past roughly 8 workers; a pure-classical (--no-vision) run can
+    use all performance cores.
+    """
     cpu = os.cpu_count() or 1
-    return max(1, min(8, cpu - 2))
+    pcores = _perf_cores()
+    base = pcores if pcores else max(1, cpu - 2)
+    if use_vision:
+        return max(1, min(8, base))
+    return max(1, min(cpu, base))
 
 
 def _progress(done: int, total: int, t0: float) -> None:
@@ -751,9 +781,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip Apple Vision (faster; classical metrics only)")
     p.add_argument("--no-faces", action="store_true",
                    help="skip per-face capture-quality (a bit faster)")
-    p.add_argument("-j", "--workers", type=int, default=_default_workers(),
-                   help="parallel worker processes (default: %(default)s; "
-                        "use 1 to disable parallelism)")
+    p.add_argument("-j", "--workers", type=int, default=None,
+                   help="parallel worker processes (default: auto — based on "
+                        "your CPU's performance cores; use 1 to disable "
+                        "parallelism)")
 
     dd = p.add_argument_group("near-duplicate detection")
     dd.add_argument("--dedupe", action="store_true",
@@ -817,13 +848,21 @@ def main(argv=None) -> int:
     use_vision = not args.no_vision
     want_faces = use_vision and not args.no_faces
     want_fprint = args.dedupe and use_vision
-    workers = max(1, args.workers)
 
     if args.dedupe and not use_vision:
         print("note: --dedupe needs Vision; ignoring --no-vision for it.",
               file=sys.stderr)
         use_vision = True
         want_fprint = True
+
+    # Worker count: honour an explicit -j, otherwise auto-detect from the host
+    # (performance cores, adjusted for whether Vision is in play).
+    if args.workers is None:
+        workers = _default_workers(use_vision)
+        worker_note = f"{workers} worker(s) (auto)"
+    else:
+        workers = max(1, args.workers)
+        worker_note = f"{workers} worker(s)"
 
     # --- cache split: reuse unchanged files, only compute the rest ----------
     cache = None
@@ -855,7 +894,7 @@ def main(argv=None) -> int:
     cache_note = (f" | {len(cached)} from cache, {len(to_compute)} to compute"
                   if cache else "")
     classical_note = " (classical only)" if not use_vision else ""
-    print(f"Analysing {len(files)} image(s) with {workers} worker(s)"
+    print(f"Analysing {len(files)} image(s) with {worker_note}"
           f"{classical_note}{cache_note}...", file=sys.stderr)
 
     fresh = run_analysis(to_compute, use_vision, want_faces, want_fprint,
