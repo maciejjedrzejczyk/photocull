@@ -18,6 +18,9 @@ In the browser you can:
 - **Select** photos individually or a whole page, see the total size selected,
   and **bulk-move them to the macOS Trash** (recoverable) or to a quarantine
   folder.
+- **Adjust thumbnail resolution and quality live** with the *size* and
+  *quality* dropdowns in the header — thumbnails re-fetch immediately and your
+  choice is remembered (per browser) across sessions.
 
 HEIC/HEIF are transcoded to JPEG on the fly so they display in any browser.
 Photos are read straight from their original locations — nothing is copied.
@@ -31,6 +34,8 @@ Photos are read straight from their original locations — nothing is copied.
 | `--host`            | Bind address (default `127.0.0.1`; keep it local).       |
 | `--quarantine DIR`  | Enable the Quarantine action, moving files into `DIR`.   |
 | `--root DIR`        | Library root used to preserve structure on quarantine (repeatable). |
+| `--thumb-size PX`   | Default thumbnail resolution, longest edge (160-2000, default 640). Adjustable live in the UI. |
+| `--thumb-quality Q` | Default thumbnail JPEG quality, 0.3-1.0 (default 0.85). Adjustable live in the UI. |
 | `--no-browser`      | Don't auto-open the browser.                             |
 
 ## Safety and security

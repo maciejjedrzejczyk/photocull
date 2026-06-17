@@ -56,6 +56,8 @@ QUARANTINE: Path | None = None  # optional quarantine destination
 QROOTS: list[Path] = []         # roots for preserving structure on quarantine
 ALLOWED_HOSTS: set[str] = {"127.0.0.1", "localhost", "::1", ""}
 ALLOW_ANY_HOST = False          # True when bound to a wildcard address
+THUMB_SIZE = 640                # default thumbnail longest-edge px (overridable)
+THUMB_QUALITY = 0.85            # default thumbnail JPEG quality (overridable)
 _LOCK = threading.Lock()
 
 # Small LRU cache of generated JPEGs: key -> bytes
@@ -146,6 +148,20 @@ def move_to_quarantine(path: str) -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 # HTTP handler
 # --------------------------------------------------------------------------
+def _clamp_int(val, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(float(val))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_float(val, default: float, lo: float, hi: float) -> float:
+    try:
+        return max(lo, min(hi, float(val)))
+    except (TypeError, ValueError):
+        return default
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "photocull-review"
 
@@ -199,7 +215,9 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/items":
             payload = json.dumps({"items": [_public(it) for it in ITEMS],
                                   "token": TOKEN,
-                                  "quarantine": bool(QUARANTINE)})
+                                  "quarantine": bool(QUARANTINE),
+                                  "thumb_size": THUMB_SIZE,
+                                  "thumb_quality": THUMB_QUALITY})
             return self._send(200, payload, "application/json")
 
         if route in ("/thumb", "/full"):
@@ -207,9 +225,10 @@ class Handler(BaseHTTPRequestHandler):
             if it is None or it["abspath"] not in ALLOWED or it.get("removed"):
                 return self._send(404, b"", "image/jpeg")
             if route == "/thumb":
-                max_px, quality = 640, 0.85
+                max_px = _clamp_int(qs.get("size", [None])[0], THUMB_SIZE, 160, 2000)
+                quality = _clamp_float(qs.get("q", [None])[0], THUMB_QUALITY, 0.3, 1.0)
             else:
-                max_px, quality = 2200, 0.85
+                max_px, quality = 2200, 0.9
             jpg = cached_jpeg(it["abspath"], max_px, quality)
             if jpg is None:
                 return self._send(404, b"", "image/jpeg")
@@ -337,7 +356,7 @@ INDEX_HTML = r"""<!doctype html>
   button.danger { background:#b4452f; border-color:#b4452f; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   .bar2 { margin-top:8px; color:var(--muted); }
-  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:12px; padding:14px; }
+  #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(var(--tile,190px),1fr)); gap:12px; padding:14px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:9px; overflow:hidden; position:relative; }
   .card.keeper { border-color:#caa23a; }
   .card.sel { outline:2px solid #3b82f6; }
@@ -379,6 +398,24 @@ INDEX_HTML = r"""<!doctype html>
         <option value="name">name</option>
       </select>
     </label>
+    <label class="f">size
+      <select id="thumbsize">
+        <option value="320">XS</option>
+        <option value="480">S</option>
+        <option value="640">M</option>
+        <option value="900">L</option>
+        <option value="1200">XL</option>
+        <option value="1600">XXL</option>
+      </select>
+    </label>
+    <label class="f">quality
+      <select id="thumbq">
+        <option value="0.6">low</option>
+        <option value="0.75">medium</option>
+        <option value="0.85">high</option>
+        <option value="0.95">max</option>
+      </select>
+    </label>
     <div class="spacer"></div>
     <button id="selpage">Select page</button>
     <button id="selnone">Clear</button>
@@ -407,11 +444,26 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const TOKEN = "__TOKEN__";
 let ALL = [], HAS_QUAR = false, sel = new Set(), page = 0;
+let thumbSize = 640, thumbQ = 0.85;
 const PAGE = 120;
 const tiers = ["delete","duplicate","review","keep"];
 const tierOn = {delete:true, duplicate:true, review:true, keep:false};
 const $ = s => document.querySelector(s);
 const fmtBytes = n => { n=+n||0; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(1)+" "+u[i]; };
+const thumbURL = id => `/thumb?i=${id}&size=${thumbSize}&q=${thumbQ}`;
+function applyTile(){
+  // Display tile ~ half the fetched resolution (retina-friendly), clamped.
+  const t = Math.max(150, Math.min(560, Math.round(thumbSize/2)));
+  document.documentElement.style.setProperty("--tile", t + "px");
+}
+function loadPrefs(){
+  const s = +localStorage.getItem("pc_thumb_size"); if(s) thumbSize = s;
+  const q = +localStorage.getItem("pc_thumb_q"); if(q) thumbQ = q;
+}
+function savePrefs(){
+  localStorage.setItem("pc_thumb_size", thumbSize);
+  localStorage.setItem("pc_thumb_q", thumbQ);
+}
 
 function buildFilters(){
   const c = $("#filters"); c.innerHTML="";
@@ -451,7 +503,7 @@ function render(){
     d.innerHTML = `
       <input type="checkbox" class="chk" ${sel.has(x.id)?"checked":""}>
       ${kp}
-      <div class="thumbwrap"><img loading="lazy" src="/thumb?i=${x.id}" alt=""></div>
+      <div class="thumbwrap"><img loading="lazy" src="${thumbURL(x.id)}" alt=""></div>
       <div class="meta">
         <div class="name" title="${x.name}">${x.name}</div>
         <div><span class="badge b-${x.recommendation}">${x.recommendation}</span>
@@ -519,10 +571,26 @@ $("#selpage").onclick=()=>{ visible().slice(page*PAGE,(page+1)*PAGE).forEach(x=>
 $("#selnone").onclick=()=>{ sel.clear(); render(); };
 $("#q").oninput=()=>{page=0;render();};
 $("#sort").onchange=()=>{page=0;render();};
+$("#thumbsize").onchange=e=>{ thumbSize=+e.target.value; savePrefs(); applyTile(); render(); };
+$("#thumbq").onchange=e=>{ thumbQ=+e.target.value; savePrefs(); render(); };
+
+function syncThumbControls(){
+  // Snap the selects to the nearest available option for the current values.
+  const sizes=[...$("#thumbsize").options].map(o=>+o.value);
+  const near=sizes.reduce((a,b)=>Math.abs(b-thumbSize)<Math.abs(a-thumbSize)?b:a);
+  $("#thumbsize").value=near; thumbSize=near;
+  const qs=[...$("#thumbq").options].map(o=>+o.value);
+  const nq=qs.reduce((a,b)=>Math.abs(b-thumbQ)<Math.abs(a-thumbQ)?b:a);
+  $("#thumbq").value=nq; thumbQ=nq;
+}
 
 (async function init(){
   const j = await (await fetch("/api/items")).json();
   ALL = j.items; HAS_QUAR = j.quarantine;
+  thumbSize = j.thumb_size || thumbSize; thumbQ = j.thumb_quality || thumbQ;
+  loadPrefs();              // a saved preference overrides the server default
+  syncThumbControls();
+  applyTile();
   buildFilters(); render();
 })();
 </script>
@@ -533,6 +601,7 @@ $("#sort").onchange=()=>{page=0;render();};
 # --------------------------------------------------------------------------
 def main(argv=None) -> int:
     global TOKEN, QUARANTINE, QROOTS, ALLOWED_HOSTS, ALLOW_ANY_HOST
+    global THUMB_SIZE, THUMB_QUALITY
     ap = argparse.ArgumentParser(
         prog="photocull-review",
         description="Local web gallery to triage a photocull CSV report "
@@ -552,6 +621,12 @@ def main(argv=None) -> int:
                          "quarantine (repeatable)")
     ap.add_argument("--no-browser", action="store_true",
                     help="don't auto-open the browser")
+    ap.add_argument("--thumb-size", type=int, default=640, metavar="PX",
+                    help="default thumbnail resolution, longest edge in px "
+                         "(160-2000, default 640); adjustable live in the UI")
+    ap.add_argument("--thumb-quality", type=float, default=0.85, metavar="Q",
+                    help="default thumbnail JPEG quality 0.3-1.0 (default 0.85); "
+                         "adjustable live in the UI")
     args = ap.parse_args(argv)
 
     if not args.csv.exists():
@@ -566,6 +641,8 @@ def main(argv=None) -> int:
     TOKEN = secrets.token_urlsafe(24)
     QUARANTINE = args.quarantine
     QROOTS = args.root
+    THUMB_SIZE = max(160, min(2000, args.thumb_size))
+    THUMB_QUALITY = max(0.3, min(1.0, args.thumb_quality))
 
     # Build the Host-header allow-list. Localhost is always allowed; an explicit
     # --host is added so direct remote access works. A wildcard bind accepts any
