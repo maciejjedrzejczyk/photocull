@@ -75,7 +75,10 @@ def make_jpeg(path: str, max_px: int, quality: float = 0.72) -> bytes | None:
         if src is None:
             return None
         opts = {
-            Quartz.kCGImageSourceCreateThumbnailFromImageIfAbsent: True,
+            # Generate from the full image (NOT the small embedded preview that
+            # iPhone HEICs ship), so the requested resolution is actually
+            # delivered up to the image's native size.
+            Quartz.kCGImageSourceCreateThumbnailFromImageAlways: True,
             Quartz.kCGImageSourceThumbnailMaxPixelSize: int(max_px),
             Quartz.kCGImageSourceCreateThumbnailWithTransform: True,
         }
