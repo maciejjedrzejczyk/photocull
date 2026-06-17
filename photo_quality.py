@@ -103,6 +103,7 @@ class Thresholds:
 @dataclass
 class Metrics:
     path: str
+    asset_id: str = ""
     width: int = 0
     height: int = 0
     megapixels: float = 0.0
@@ -408,7 +409,7 @@ CSV_FIELDS = [
     "path", "recommendation", "reasons", "sharpness", "brightness",
     "contrast", "noise", "black_frac", "white_frac", "aesthetic",
     "is_utility", "face_quality", "cluster_id", "cluster_size", "is_keeper",
-    "width", "height", "megapixels", "file_bytes", "error",
+    "width", "height", "megapixels", "file_bytes", "asset_id", "error",
 ]
 
 

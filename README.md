@@ -80,6 +80,24 @@ Browse thumbnails, filter by tier, sort by metric or `cluster`, click for a
 full-size view, then bulk-move rejects to the Trash or a quarantine folder.
 Details and the security model in [docs/review.md](docs/review.md).
 
+### (d) Analyse the Apple Photos library (instead of files)
+
+photocull can also scan your **Apple Photos library** directly and gather the
+candidates into review albums inside Photos:
+
+```bash
+./build_photos_app.sh                 # build PhotoCull.app (one time)
+# move it to /Applications, double-click, click Allow on the Photos prompt
+```
+
+Edit `~/.photocull/photos.args` to choose a subset (`--album`, `--smart-album`,
+`--since/--until`, `--limit`, `--dedupe`); favourites are excluded by default.
+Each run creates timestamped review albums in Photos.app —
+`photocull <date-time> Delete candidates` / `Duplicates` / `Review` — for you to
+browse and delete in Photos; it never deletes anything itself. The album title
+is configurable (`--album-template`, `--album-date-format`). Full guide in
+[docs/photos.md](docs/photos.md).
+
 ## Known limitations
 
 - **Variance of the Laplacian conflates focus with contrast.** A correctly
@@ -101,6 +119,7 @@ Details and the security model in [docs/review.md](docs/review.md).
 - [docs/options.md](docs/options.md) — full command-line reference.
 - [docs/dedupe.md](docs/dedupe.md) — near-duplicate detection in depth.
 - [docs/review.md](docs/review.md) — the review gallery and its security model.
+- [docs/photos.md](docs/photos.md) — analysing the Apple Photos library directly.
 - [docs/cache.md](docs/cache.md) — the on-disk result cache.
 - [docs/performance.md](docs/performance.md) — performance and worker tuning.
 
