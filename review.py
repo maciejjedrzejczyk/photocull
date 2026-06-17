@@ -355,7 +355,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <div class="row">
-    <h1>📷 photocull review</h1>
+    <h1>photocull review</h1>
     <span id="filters" class="row"></span>
     <input id="q" type="search" placeholder="filter by filename…" style="width:180px">
     <label class="f">sort
