@@ -60,6 +60,7 @@ ALLOWED_HOSTS: set[str] = {"127.0.0.1", "localhost", "::1", ""}
 ALLOW_ANY_HOST = False          # True when bound to a wildcard address
 THUMB_SIZE = 640                # default thumbnail longest-edge px (overridable)
 THUMB_QUALITY = 0.85            # default thumbnail JPEG quality (overridable)
+PATH_TO_ID: dict[str, int] = {}  # abspath -> item id (for companion bookkeeping)
 _LOCK = threading.Lock()
 
 # Small LRU cache of generated JPEGs: key -> bytes
@@ -278,51 +279,101 @@ class Handler(BaseHTTPRequestHandler):
 
         action = body.get("action")
         ids = body.get("ids", [])
+        with_companions = bool(body.get("companions"))
         if action not in ("trash", "quarantine", "restore"):
             return self._send(400, '{"error":"bad action"}', "application/json")
 
         results = []
         freed = 0
+        affected = set()        # tracked item ids whose removed-state changed
+        owners = []             # ids carrying move records (for undo)
+        companions_moved = 0
+
+        # ---- restore (undo): move every recorded file back ----
+        if action == "restore":
+            for i in ids:
+                if not isinstance(i, int) or not (0 <= i < len(ITEMS)):
+                    results.append({"id": i, "ok": False, "error": "bad id"})
+                    continue
+                it = ITEMS[i]
+                moved = it.get("moved") or []
+                if not moved:
+                    results.append({"id": i, "ok": False, "error": "nothing to restore"})
+                    continue
+                all_ok = True
+                for orig, dest in moved:
+                    ok, err = restore_from(dest, orig)
+                    if ok:
+                        j = PATH_TO_ID.get(orig)
+                        if j is not None:
+                            with _LOCK:
+                                ITEMS[j]["removed"] = False
+                                ITEMS[j]["moved"] = []
+                                if Path(orig).exists():
+                                    ALLOWED.add(orig)
+                            affected.add(j)
+                            freed -= int(ITEMS[j].get("file_bytes") or 0)
+                    else:
+                        all_ok = False
+                if all_ok:
+                    with _LOCK:
+                        it["moved"] = []
+                results.append({"id": i, "ok": all_ok, "error": ""})
+            return self._send(200, json.dumps(
+                {"results": results, "freed": freed, "affected": list(affected),
+                 "owners": []}), "application/json")
+
+        # ---- trash / quarantine: plan the set of files to move ----
+        planned = []            # (path, owner_item_id)
+        seen = set()
         for i in ids:
             if not isinstance(i, int) or not (0 <= i < len(ITEMS)):
                 results.append({"id": i, "ok": False, "error": "bad id"})
                 continue
             it = ITEMS[i]
             p = it["abspath"]
-
-            if action == "restore":
-                # Undo a previous trash/quarantine for this item.
-                if not it.get("removed"):
-                    results.append({"id": i, "ok": False, "error": "not removed"})
-                    continue
-                ok, err = restore_from(it.get("moved_to", ""), p)
-                if ok:
-                    with _LOCK:
-                        it["removed"] = False
-                        it["moved_to"] = ""
-                        if Path(p).exists():
-                            ALLOWED.add(p)
-                    freed -= int(it.get("file_bytes") or 0)
-                results.append({"id": i, "ok": ok, "error": err})
-                continue
-
             if p not in ALLOWED or it.get("removed"):
                 results.append({"id": i, "ok": False, "error": "not allowed"})
                 continue
+            if p not in seen:
+                planned.append((p, i)); seen.add(p)
+            if with_companions:
+                for c in it.get("companions", []):
+                    if c not in seen and Path(c).exists():
+                        planned.append((c, i)); seen.add(c)
+
+        ok_owner = {}
+        for path, owner in planned:
             if action == "trash":
-                ok, moved_to, err = move_to_trash(p)
+                ok, moved_to, err = move_to_trash(path)
             else:
-                ok, moved_to, err = move_to_quarantine(p)
+                ok, moved_to, err = move_to_quarantine(path)
             if ok:
                 with _LOCK:
-                    it["removed"] = True
-                    it["moved_to"] = moved_to
-                    ALLOWED.discard(p)
-                freed += int(it.get("file_bytes") or 0)
-            results.append({"id": i, "ok": ok, "error": err})
+                    ITEMS[owner].setdefault("moved", []).append((path, moved_to))
+                j = PATH_TO_ID.get(path)
+                if j is not None:                 # the moved file is itself a report item
+                    with _LOCK:
+                        ITEMS[j]["removed"] = True
+                        ALLOWED.discard(path)
+                    affected.add(j)
+                    freed += int(ITEMS[j].get("file_bytes") or 0)
+                else:                              # an untracked sidecar (e.g. the RAW)
+                    companions_moved += 1
+                    try:
+                        freed += Path(moved_to).stat().st_size if moved_to else 0
+                    except OSError:
+                        pass
+            ok_owner[owner] = ok_owner.get(owner, True) and ok
+        for owner in ok_owner:
+            results.append({"id": owner, "ok": ok_owner[owner], "error": ""})
+            if ITEMS[owner].get("moved"):
+                owners.append(owner)
 
-        return self._send(200, json.dumps({"results": results, "freed": freed}),
-                          "application/json")
+        return self._send(200, json.dumps(
+            {"results": results, "freed": freed, "affected": list(affected),
+             "owners": owners, "companions_moved": companions_moved}),
+            "application/json")
 
 
 def _public(it: dict) -> dict:
@@ -331,7 +382,9 @@ def _public(it: dict) -> dict:
             "brightness", "contrast", "noise", "aesthetic", "is_utility",
             "face_quality", "cluster_id", "cluster_size", "is_keeper",
             "megapixels", "file_bytes", "exists", "removed")
-    return {k: it.get(k) for k in keep}
+    out = {k: it.get(k) for k in keep}
+    out["companions"] = [Path(p).name for p in it.get("companions", [])]
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -368,11 +421,53 @@ def load_csv(path: Path) -> None:
                 "file_bytes": fb,
                 "exists": exists,
                 "removed": False,
-                "moved_to": "",
+                "moved": [],          # [(orig, dest), …] moved this commit, for restore
+                "companions": [],     # same-stem, same-dir sidecar files (abspaths)
             }
             ITEMS.append(it)
             if exists:
                 ALLOWED.add(ap)
+    index_companions()
+
+
+def index_companions() -> None:
+    """Find same-stem, same-directory **sidecar** files for each item.
+
+    Cameras often write a JPEG next to its RAW (e.g. ``DSC04485.JPG`` and
+    ``DSC04485.ARW``) — the same photo in two files. The report usually lists
+    only the JPEG, so deleting it would leave the RAW behind. Here we record,
+    per item, every other regular file that shares its **base name** *and* its
+    **directory** (so ``a/DSC04485.ARW`` is NOT a companion of ``b/DSC04485.JPG``).
+    Matching is case-insensitive on the stem (macOS filesystems usually are).
+    """
+    import os
+    PATH_TO_ID.clear()
+    for it in ITEMS:
+        if it["abspath"]:
+            PATH_TO_ID[it["abspath"]] = it["id"]
+
+    dir_index: dict[str, dict[str, list]] = {}
+    for it in ITEMS:
+        ap = it["abspath"]
+        it["companions"] = []
+        if not ap or not it["exists"]:
+            continue
+        d = str(Path(ap).parent)
+        if d not in dir_index:
+            idx: dict[str, list] = {}
+            try:
+                with os.scandir(d) as sd:
+                    for e in sd:
+                        try:
+                            if e.is_file():
+                                idx.setdefault(Path(e.name).stem.lower(), []).append(e.path)
+                        except OSError:
+                            continue
+            except OSError:
+                idx = {}
+            dir_index[d] = idx
+        sibs = [p for p in dir_index[d].get(Path(ap).stem.lower(), []) if p != ap]
+        it["companions"] = sorted(set(sibs))
 
 
 # --------------------------------------------------------------------------
@@ -430,6 +525,21 @@ INDEX_HTML = r"""<!doctype html>
   .tag-rej{ background:#7a2618; color:#ffd9cf; } .tag-keep{ background:#244a2c; color:#cfeccf; }
   .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:34px; padding:6px 16px; background:rgba(0,0,0,.4); cursor:pointer; user-select:none; }
   #fprev{left:6px;} #fnext{right:6px;}
+  /* cluster compare */
+  #compare { position:fixed; inset:0; background:rgba(0,0,0,.95); display:none; z-index:19; flex-direction:column; }
+  #compare.show { display:flex; }
+  #cmpbar { padding:10px 16px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  #cmpgrid { flex:1; min-height:0; overflow:auto; display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:12px; padding:14px; align-content:start; }
+  .cmpcard { background:var(--panel); border:1px solid var(--line); border-radius:9px; overflow:hidden; display:flex; flex-direction:column; }
+  .cmpcard.keeper { border-color:#caa23a; }
+  .cmpcard.rej { outline:2px solid #e0593c; }
+  .cmpcard.kept { outline:2px solid #36a85a; }
+  .cmpimg { background:#0c0d10; height:46vh; display:flex; align-items:center; justify-content:center; cursor:zoom-in; }
+  .cmpimg img { max-width:100%; max-height:100%; object-fit:contain; }
+  .cmpmeta { padding:8px 10px; font-size:12px; }
+  .cmpbtns { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+  .cmpbtns button { padding:4px 8px; font-size:12px; }
+  .cmpbtn { margin-top:6px; padding:3px 8px; font-size:12px; width:100%; }
   kbd { background:#2a2f39; border:1px solid var(--line); border-radius:4px; padding:0 5px; font-size:11px; }
   .hint { color:var(--muted); font-size:12px; }
   .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#262a33; border:1px solid var(--line); padding:10px 16px; border-radius:8px; z-index:30; display:none; }
@@ -473,6 +583,7 @@ INDEX_HTML = r"""<!doctype html>
     <button id="focusBtn">▶ Focus mode</button>
     <button id="selpage">Mark page ✗</button>
     <button id="clearmarks">Clear marks</button>
+    <label class="f" title="When a marked photo has a RAW/HEIC/sidecar file of the SAME name in the SAME folder (e.g. DSC04485.ARW next to DSC04485.JPG), delete it too."><input type="checkbox" id="withComp" checked> also delete RAW/sidecars</label>
     <div class="spacer"></div>
     <button id="btnTrash" class="danger" disabled>Commit ✗ → Trash</button>
     <button id="btnQuar" class="primary" disabled>Commit ✗ → Quarantine</button>
@@ -495,6 +606,7 @@ INDEX_HTML = r"""<!doctype html>
     <span id="fpos" class="muted"></span>
     <button id="fReject" class="danger">✗ Reject</button>
     <button id="fKeep" class="primary">✓ Keep</button>
+    <button id="fCompare">⊞ Cluster</button>
     <button id="fZoom">Zoom</button>
     <button id="fBright">Brighten</button>
     <button id="fClose">Close</button>
@@ -502,7 +614,23 @@ INDEX_HTML = r"""<!doctype html>
   <div class="hint" style="padding:0 16px 8px">
     <kbd>←</kbd>/<kbd>→</kbd> move · <kbd>X</kbd>/<kbd>⌫</kbd> reject &amp; next ·
     <kbd>K</kbd>/<kbd>↵</kbd> keep &amp; next · <kbd>U</kbd> unmark ·
-    <kbd>Z</kbd> zoom · <kbd>B</kbd> brighten · <kbd>Esc</kbd> close
+    <kbd>C</kbd> compare cluster · <kbd>Z</kbd> zoom · <kbd>B</kbd> brighten ·
+    <kbd>Esc</kbd> close
+  </div>
+</div>
+
+<div id="compare">
+  <div id="cmpbar">
+    <b id="cmptitle"></b>
+    <span class="spacer"></span>
+    <button id="cmpKeepBest" class="primary">Keep keeper · reject rest</button>
+    <button id="cmpClear">Clear cluster marks</button>
+    <button id="cmpClose">Close</button>
+  </div>
+  <div id="cmpgrid"></div>
+  <div class="hint" style="padding:6px 16px 10px">
+    Click an image to inspect it full-screen. Per frame: <b>✗ Reject</b> ·
+    <b>✓ Keep</b> · <b>Keep this · reject rest</b>. <kbd>Esc</kbd> closes.
   </div>
 </div>
 <div id="toast" class="toast"></div>
@@ -587,6 +715,13 @@ function inCluster(x){ return +x.cluster_size>1 && +x.cluster_id>=0; }
 
 function tileMarkClass(x){ const m=mark.get(x.id); return m==="reject"?" rej":(m==="keep"?" kept":""); }
 
+function compNote(x){
+  const c = x.companions || [];
+  if(!c.length) return "";
+  const label = c.length===1 ? c[0] : `${c.length} sidecar files`;
+  return `<div class="muted" title="also deleted with this photo: ${c.join(', ')}">⛓ +${label}</div>`;
+}
+
 function makeCard(x){
   const d = document.createElement("div");
   d.className = "card" + (isClusterKeeper(x)?" keeper":"") + tileMarkClass(x);
@@ -603,6 +738,7 @@ function makeCard(x){
         <span class="muted">${fmtBytes(x.file_bytes)}</span></div>
       <div class="muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.reasons||""} ${clu}</div>
       <div class="muted">sharp ${x.sharpness||"–"} · aes ${x.aesthetic||"–"}</div>
+      ${compNote(x)}
     </div>`;
   const chk = d.querySelector(".chk");
   chk.addEventListener("click", e => {
@@ -611,6 +747,13 @@ function makeCard(x){
     lastClickId = x.id; render();
   });
   d.querySelector(".thumbwrap").onclick = () => openFocus(x.id);
+  if(inCluster(x)){
+    const cb = document.createElement("button");
+    cb.className = "cmpbtn";
+    cb.textContent = `⊞ Compare cluster (${x.cluster_size})`;
+    cb.onclick = e => { e.stopPropagation(); openCompare(x.cluster_id); };
+    d.querySelector(".meta").appendChild(cb);
+  }
   return d;
 }
 function render(){
@@ -633,6 +776,10 @@ function render(){
       btn.textContent = "Mark others ✗"; btn.className="danger";
       btn.onclick = () => { members.forEach(y=>{ if(!isClusterKeeper(y)) setMark(y.id,"reject"); }); render(); };
       h.appendChild(btn);
+      const cmp = document.createElement("button");
+      cmp.textContent = "⊞ Compare";
+      cmp.onclick = () => openCompare(x.cluster_id);
+      h.appendChild(cmp);
       g.appendChild(h);
     }
     g.appendChild(makeCard(x));
@@ -671,10 +818,13 @@ function updateBars(){
 // ---- focus mode ----
 let fList=[], fPos=0, fZoom=false, fBright=false;
 function metaLine(x){
-  return ` ${x.recommendation} · ${x.reasons||"–"} · sharp ${x.sharpness||"–"} · bright ${x.brightness||"–"} · aes ${x.aesthetic||"–"} · ${fmtBytes(x.file_bytes)} · ${x.megapixels||"?"} MP`;
+  const c = x.companions || [];
+  const comp = c.length ? ` · ⛓ +${c.length} sidecar (${c.join(', ')})` : "";
+  return ` ${x.recommendation} · ${x.reasons||"–"} · sharp ${x.sharpness||"–"} · bright ${x.brightness||"–"} · aes ${x.aesthetic||"–"} · ${fmtBytes(x.file_bytes)} · ${x.megapixels||"?"} MP${comp}`;
 }
-function openFocus(id){
-  fList = visible().map(x=>x.id);
+function openFocus(id){ openFocusList(visible().map(x=>x.id), id); }
+function openFocusList(ids, id){
+  fList = ids.slice();
   fPos = Math.max(0, fList.indexOf(id));
   fZoom=false; fBright=false;
   $("#focus").classList.add("show");
@@ -700,7 +850,7 @@ function showFocus(){
 }
 function focusStep(d){ fPos+=d; fZoom=false; showFocus(); }
 function focusMark(val){ const id=fList[fPos]; setMark(id, mark.get(id)===val?null:val); }
-function closeFocus(){ $("#focus").classList.remove("show"); $("#fpic").src=""; buildFilters(); buildSignalFilters(); render(); }
+function closeFocus(){ $("#focus").classList.remove("show"); $("#fpic").src=""; buildFilters(); buildSignalFilters(); render(); if($("#compare").classList.contains("show")) renderCompare(); }
 
 $("#fprev").onclick=()=>focusStep(-1);
 $("#fnext").onclick=()=>focusStep(1);
@@ -709,10 +859,63 @@ $("#fKeep").onclick=()=>{ focusMark("keep"); if(fPos<fList.length-1)focusStep(1)
 $("#fZoom").onclick=()=>{ fZoom=!fZoom; showFocus(); };
 $("#fBright").onclick=()=>{ fBright=!fBright; showFocus(); };
 $("#fClose").onclick=closeFocus;
+$("#fCompare").onclick=()=>{ const x=ALL[fList[fPos]]; if(x && inCluster(x)) openCompare(x.cluster_id); else toast("This photo isn't part of a near-duplicate cluster."); };
 $("#focusBtn").onclick=()=>{ const v=visible(); if(v.length) openFocus(v[0].id); };
 
+// ---- cluster compare ----
+let cmpCluster = null;
+function clusterMembers(id){
+  return ALL.filter(x=>!x.removed && String(x.cluster_id)===String(id) && inCluster(x))
+            .sort((a,b)=> ((b.is_keeper==="True")-(a.is_keeper==="True"))
+                          || ((parseFloat(b.sharpness)||0)-(parseFloat(a.sharpness)||0)));
+}
+function openCompare(id){
+  cmpCluster = id;
+  $("#focus").classList.remove("show"); $("#fpic").src="";   // hand off from focus if open
+  $("#compare").classList.add("show");
+  renderCompare();
+}
+function closeCompare(){ $("#compare").classList.remove("show"); $("#cmpgrid").innerHTML=""; buildFilters(); buildSignalFilters(); render(); }
+function renderCompare(){
+  const members = clusterMembers(cmpCluster);
+  const keeper = members.find(x=>x.is_keeper==="True");
+  $("#cmptitle").textContent = `Cluster ${cmpCluster} · ${members.length} frame(s)` + (keeper?` · suggested keeper: ${keeper.name}`:"");
+  const g = $("#cmpgrid"); g.innerHTML="";
+  if(!members.length){ g.innerHTML='<div class="muted" style="padding:14px">No frames left in this cluster.</div>'; updateBars(); return; }
+  members.forEach(x=>{
+    const m = mark.get(x.id);
+    const d = document.createElement("div");
+    d.className = "cmpcard" + (x.is_keeper==="True"?" keeper":"") + (m==="reject"?" rej":(m==="keep"?" kept":""));
+    d.innerHTML = `
+      <div class="cmpimg"><img loading="lazy" src="/thumb?i=${x.id}&size=1000&q=0.85" alt=""></div>
+      <div class="cmpmeta">
+        <div class="name" title="${x.name}">${x.is_keeper==="True"?"★ ":""}${x.name}
+          <span class="badge b-${x.recommendation}">${x.recommendation}</span></div>
+        <div class="muted">sharp ${x.sharpness||"–"} · aes ${x.aesthetic||"–"} · bright ${x.brightness||"–"} · ${x.megapixels||"?"} MP · ${fmtBytes(x.file_bytes)}</div>
+        ${compNote(x)}
+        <div class="cmpbtns">
+          <button class="danger" data-a="rej">${m==="reject"?"✗ Rejected":"✗ Reject"}</button>
+          <button class="primary" data-a="keep">${m==="keep"?"✓ Kept":"✓ Keep"}</button>
+          <button data-a="only">Keep this · reject rest</button>
+        </div>
+      </div>`;
+    d.querySelector('[data-a="rej"]').onclick=()=>{ setMark(x.id, m==="reject"?null:"reject"); renderCompare(); };
+    d.querySelector('[data-a="keep"]').onclick=()=>{ setMark(x.id, m==="keep"?null:"keep"); renderCompare(); };
+    d.querySelector('[data-a="only"]').onclick=()=>{ members.forEach(y=>setMark(y.id, y.id===x.id?"keep":"reject")); renderCompare(); };
+    d.querySelector(".cmpimg").onclick=()=>{ openFocusList(members.map(y=>y.id), x.id); };
+    g.appendChild(d);
+  });
+  updateBars();
+}
+$("#cmpClose").onclick=closeCompare;
+$("#cmpClear").onclick=()=>{ clusterMembers(cmpCluster).forEach(x=>setMark(x.id,null)); renderCompare(); };
+$("#cmpKeepBest").onclick=()=>{ clusterMembers(cmpCluster).forEach(x=>setMark(x.id, x.is_keeper==="True"?"keep":"reject")); renderCompare(); };
+
 document.addEventListener("keydown", e=>{
-  if(!$("#focus").classList.contains("show")){
+  const inFocus = $("#focus").classList.contains("show");
+  const inCompare = $("#compare").classList.contains("show");
+  if(!inFocus){
+    if(inCompare){ if(e.key==="Escape"){ e.preventDefault(); closeCompare(); } return; }
     if((e.key==="f"||e.key==="F") && !/input|textarea|select/i.test(e.target.tagName)){
       const v=visible(); if(v.length) openFocus(v[0].id);
     }
@@ -727,6 +930,7 @@ document.addEventListener("keydown", e=>{
     case "k": case "K": case "Enter": case " ":
       e.preventDefault(); focusMark("keep"); if(fPos<fList.length-1)focusStep(1); else showFocus(); break;
     case "u": case "U": e.preventDefault(); { const id=fList[fPos]; setMark(id,null); showFocus(); } break;
+    case "c": case "C": { const x=ALL[fList[fPos]]; if(x && inCluster(x)){ e.preventDefault(); openCompare(x.cluster_id); } } break;
     case "z": case "Z": e.preventDefault(); fZoom=!fZoom; showFocus(); break;
     case "b": case "B": e.preventDefault(); fBright=!fBright; showFocus(); break;
   }
@@ -740,21 +944,29 @@ async function post(b){
 async function commit(action){
   const ids=rejectIds();
   if(!ids.length){ toast("Nothing marked for deletion."); return; }
+  const wc = $("#withComp").checked;
+  let extra=0; if(wc) ids.forEach(i=>{ extra += (ALL[i].companions ? ALL[i].companions.length : 0); });
   const verb = action==="trash" ? "Move to Trash" : "Move to Quarantine";
-  if(!confirm(`${verb}: ${ids.length} photo(s) marked ✗?\n\nRecoverable — files are moved, not erased. Use “Undo commit” right after to revert.`)) return;
-  const j=await post({action,ids});
-  let ok=0; (j.results||[]).forEach(res=>{ if(res.ok){ ok++; ALL[res.id].removed=true; mark.delete(res.id); } });
-  lastCommitted = (j.results||[]).filter(r=>r.ok).map(r=>r.id);
-  toast(`${verb}: ${ok}/${ids.length} done · ${fmtBytes(j.freed||0)} freed · Undo available`);
+  const extraTxt = extra ? ` plus ${extra} RAW/sidecar file(s) of the same name` : "";
+  if(!confirm(`${verb}: ${ids.length} photo(s) marked ✗${extraTxt}?\n\nRecoverable — files are moved, not erased. Use “Undo commit” right after to revert.`)) return;
+  const j=await post({action, ids, companions:wc});
+  (j.affected||[]).forEach(id=>{ if(ALL[id]){ ALL[id].removed=true; mark.delete(id); } });
+  ids.forEach(i=>mark.delete(i));
+  lastCommitted = j.owners || [];
+  const n=(j.affected||[]).length, cm=j.companions_moved||0;
+  toast(`${verb}: ${n} photo(s)` + (cm?` + ${cm} sidecar(s)`:"") + ` · ${fmtBytes(j.freed||0)} freed · Undo available`);
   if(fList.length){ fList=fList.filter(id=>!ALL[id].removed); showFocus(); }
   buildFilters(); buildSignalFilters(); render();
+  if($("#compare").classList.contains("show")) renderCompare();
 }
 async function undoCommit(){
   if(!lastCommitted.length){ return; }
-  const j=await post({action:"restore",ids:lastCommitted});
-  let ok=0; (j.results||[]).forEach(res=>{ if(res.ok){ ok++; ALL[res.id].removed=false; } });
-  toast(`Restored ${ok}/${lastCommitted.length} photo(s).`);
+  const j=await post({action:"restore", ids:lastCommitted});
+  (j.affected||[]).forEach(id=>{ if(ALL[id]) ALL[id].removed=false; });
+  const n=(j.affected||[]).length;
+  toast(`Restored ${n} photo(s) and any sidecar files.`);
   lastCommitted=[]; buildFilters(); buildSignalFilters(); render();
+  if($("#compare").classList.contains("show")) renderCompare();
 }
 $("#btnTrash").onclick=()=>commit("trash");
 $("#btnQuar").onclick=()=>commit("quarantine");
