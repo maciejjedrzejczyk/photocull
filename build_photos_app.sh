@@ -10,7 +10,9 @@
 # Usage:
 #   ./build_photos_app.sh [OUTPUT_APP_PATH]
 # Then MOVE the app out of Downloads/Desktop/Documents (e.g. to /Applications)
-# and double-click it. Configure the scan by editing ~/.photocull/photos.args.
+# and double-click it. On launch it asks you to choose a working folder (for
+# photos.args, the report and the cache); you can also fix the folder with
+#   open -a PhotoCull --args /path/to/folder      (or set $PHOTOCULL_HOME).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,13 +54,62 @@ python3 -m venv "$RES/venv"
 
 cat > "$MACOS/photocull" <<'LAUNCH'
 #!/bin/bash
-# Launcher: reads scan options from ~/.photocull/photos.args, runs the Photos
-# analyser, writes the report/cache to ~/.photocull (not a protected folder),
-# and opens the run log when finished. Review albums appear in Photos.app.
+# Launcher: resolves a *working folder* (which holds photos.args, report.csv and
+# the cache), runs the Photos analyser, and opens the run log when finished.
+# Review albums appear in Photos.app.
+#
+# The working folder is chosen, in priority order:
+#   1) the first launch argument:  open -a PhotoCull --args /path/to/folder
+#   2) the $PHOTOCULL_HOME environment variable
+#   3) an interactive "choose folder" prompt shown on launch (double-click)
+#   4) the historical default ~/.photocull  (if the prompt is cancelled, or no
+#      GUI is available, e.g. headless/automated runs)
 set -u
 RES="$(cd "$(dirname "$0")/../Resources" && pwd)"
-OUT="$HOME/.photocull"
+STATE_DIR="$HOME/Library/Application Support/PhotoCull"
+PTR="$STATE_DIR/last_home"
+DEFAULT_HOME="$HOME/.photocull"
+
+OUT=""
+if [ "${1:-}" != "" ]; then
+  OUT="$1"                                    # explicit path argument wins
+elif [ "${PHOTOCULL_HOME:-}" != "" ]; then
+  OUT="$PHOTOCULL_HOME"                        # environment override
+else
+  # No path supplied -> ask the user upon launch, starting at the last-used dir.
+  START="$HOME"
+  if [ -f "$PTR" ]; then
+    LAST="$(cat "$PTR" 2>/dev/null || true)"
+    [ -n "$LAST" ] && [ -d "$LAST" ] && START="$LAST"
+  fi
+  CHOSEN="$(osascript - "$START" 2>/dev/null <<'OSA'
+on run argv
+  try
+    set startLoc to ((POSIX file (item 1 of argv)) as alias)
+  on error
+    set startLoc to (path to home folder)
+  end try
+  try
+    set f to choose folder with prompt "Choose PhotoCull's working folder (holds photos.args, report.csv and the cache):" default location startLoc
+    return POSIX path of f
+  on error number -128
+    return ""
+  end try
+end run
+OSA
+)"
+  if [ -n "$CHOSEN" ]; then
+    OUT="$CHOSEN"
+  else
+    OUT="$DEFAULT_HOME"                         # cancelled / headless -> default
+  fi
+fi
+
+OUT="${OUT%/}"                                  # strip any trailing slash
+[ -z "$OUT" ] && OUT="$DEFAULT_HOME"
 mkdir -p "$OUT"
+# Remember the choice so the next launch's picker opens here.
+mkdir -p "$STATE_DIR" 2>/dev/null && printf '%s\n' "$OUT" > "$PTR" 2>/dev/null || true
 CONF="$OUT/photos.args"
 if [ ! -f "$CONF" ]; then
   cat > "$CONF" <<'DEFAULTS'
@@ -91,5 +142,7 @@ echo "Built: $APP"
 echo "Next:"
 echo "  1) Move it OUT of Downloads/Desktop/Documents (e.g. to /Applications)."
 echo "  2) Double-click it; click Allow on the Photos prompt (first run only)."
-echo "  3) Edit ~/.photocull/photos.args to choose what to scan, then run again."
+echo "  3) On each launch it asks for a working folder. (Skip the prompt with"
+echo "     'open -a PhotoCull --args /path/to/folder' or by setting PHOTOCULL_HOME.)"
+echo "  4) Edit photos.args inside that folder to choose what to scan, then run again."
 echo "  Review albums appear in Photos.app, named with a 'photocull' prefix."

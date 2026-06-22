@@ -1,127 +1,84 @@
 # photocull
 
-Find and cull blurry, dark, low-quality and duplicate photos to reclaim disk space on MacOS.
+Find and cull blurry, dark, low-quality and duplicate photos to reclaim disk
+space on macOS. **photocull never deletes anything** — it reports, and only
+*moves* files to the Trash/quarantine or gathers candidates into Photos albums
+you delete yourself. Everything runs locally; nothing leaves your Mac.
 
-## Overview
+## Features
 
-`photocull` scans a photo archive and flags **blurry, dark, dull, grainy or
-otherwise low-quality** images, plus **near-duplicate/burst** frames, then
-writes a CSV report sorted worst-first. It pairs fast classical image metrics
-(sharpness, exposure, contrast, noise) with Apple's on-device **Vision**
-framework (aesthetics, screenshot/document detection, face capture quality, and
-feature-print embeddings for duplicate detection). Everything runs locally — no
-model downloads, no network, nothing leaves your Mac. HEIC/HEIF from an Apple
-photo library works out of the box.
+- **Quality detection** — flags blurry, dark, dull, grainy and badly exposed
+  shots using fast classical metrics plus Apple's on-device **Vision**
+  (aesthetics, screenshot/document detection, face capture quality).
+- **Near-duplicate / burst grouping** — clusters similar frames and keeps the
+  best one (`--dedupe`).
+- **Toggleable signals** — pick exactly what to flag with `--signals` /
+  `--exclude-signals`: `blur dark contrast noise exposure aesthetic utility face`.
+- **One worst-first report** — a CSV with a `delete` / `duplicate` / `review` /
+  `keep` tier per photo, plus an on-disk cache so re-runs are near-instant.
+- **Fast triage** — a keyboard-friendly local web gallery for files, or native
+  review albums for Apple Photos.
+- HEIC/HEIF supported out of the box.
 
-A companion **review gallery** (`./review`) turns the report into a local web
-app so you can eyeball the findings and bulk-cull from the browser.
-
-> **Safety first.** photocull **never deletes anything.** It writes a CSV report
-> and — only if you ask — *moves* flagged files to a quarantine folder or the
-> macOS Trash (recoverable). You stay in control of the actual deletion.
-
-## Requirements
-
-- macOS with Apple Vision (the aesthetics API needs macOS 15+).
-- Python 3.9+.
-
-Dependencies (`pyobjc-framework-Vision`, `pyobjc-framework-Quartz`, `numpy`) are
-installed automatically by the `scan`/`review` launchers on first run, or via
-`pip install -r requirements.txt`.
-
-## Quickstart
+**Requirements:** macOS (Vision aesthetics needs macOS 15+) and Python 3.9+.
 
 ```bash
 git clone https://github.com/maciejjedrzejczyk/photocull.git
 cd photocull
 ```
 
-The `scan` launcher creates a local virtualenv and installs dependencies on the
-first run.
+## Which photos do you want to scan?
 
-### (a) Scan a library for low-quality photos
+The same engine, signals and report work either way — only the source and the
+review surface differ.
+
+### → Local files
 
 ```bash
-./scan ~/Pictures -r                                  # recursive scan -> photo_quality_report.csv
-./scan ~/Pictures -r -o report.csv                    # choose the report path
-./scan ~/Pictures -r --no-vision                      # classical metrics only (faster)
-./scan ~/Pictures -r -j 8                             # run on 8 worker processes (parallel)
-./scan ~/Pictures -r --quarantine ~/_rejects --dry-run  # preview moving flagged files
-./scan ~/Pictures -r --quarantine ~/_rejects          # move them (never deletes)
+./scan ~/Pictures -r                       # scan a folder -> photo_quality_report.csv
+./scan ~/Pictures -r --dedupe              # also group near-duplicates
+./scan ~/Pictures -r --signals blur,dark   # only flag certain kinds
 ```
 
-**Performance.** photocull runs in parallel across multiple processes. By
-default the worker count is **auto-detected from your CPU's performance cores**
-(and capped when Vision is in play, since Vision shares the Neural Engine).
-Override it with `-j N` (`--workers`) to trade speed against keeping the machine
-responsive. See [docs/performance.md](docs/performance.md) for guidance.
-
-Common options: `-j N` (workers), `--blur`, `--dark`, `--noise`, etc.
-Full list in [docs/options.md](docs/options.md).
-
-### (b) Scan and also detect near-duplicates / bursts
+**Review:** open the report in a local web gallery, mark candidates, then commit
+the marked set to the Trash or a quarantine folder (recoverable, with undo):
 
 ```bash
-./scan ~/Pictures -r --dedupe                         # cluster bursts, keep the best of each
-./scan ~/Pictures -r --dedupe --dedupe-threshold 0.25 # stricter (safer) clustering
+./review photo_quality_report.csv
 ```
 
-`--dedupe` adds a `duplicate` tier and `cluster_id`/`is_keeper` columns. The
-default threshold is conservative on purpose. See [docs/dedupe.md](docs/dedupe.md).
+### → Apple Photos library
 
-### (c) Review the results in a browser
-
-```bash
-./review photo_quality_report.csv                     # opens a local gallery
-./review report.csv --quarantine ~/_rejects --root ~/Pictures
-```
-
-Browse thumbnails, filter by tier, sort by metric or `cluster`, click for a
-full-size view, then bulk-move rejects to the Trash or a quarantine folder.
-Details and the security model in [docs/review.md](docs/review.md).
-
-### (d) Analyse the Apple Photos library (instead of files)
-
-photocull can also scan your **Apple Photos library** directly and gather the
-candidates into review albums inside Photos:
+Photos access needs a signed app bundle that embeds the same engine:
 
 ```bash
-./build_photos_app.sh                 # build PhotoCull.app (one time)
+./build_photos_app.sh        # build PhotoCull.app (one time)
 # move it to /Applications, double-click, click Allow on the Photos prompt
 ```
 
-Edit `~/.photocull/photos.args` to choose a subset (`--album`, `--smart-album`,
-`--since/--until`, `--limit`, `--dedupe`); favourites are excluded by default.
-Each run creates timestamped review albums in Photos.app —
-`photocull <date-time> Delete candidates` / `Duplicates` / `Review` — for you to
-browse and delete in Photos; it never deletes anything itself. The album title
-is configurable (`--album-template`, `--album-date-format`). Full guide in
-[docs/photos.md](docs/photos.md).
+On launch it asks for a **working folder**. Edit `photos.args` there to choose
+what to scan and how (same detection flags as `./scan`, plus a subset selector):
 
-## Known limitations
+```
+--smart-album recently-added
+--signals blur,dark,contrast,noise,exposure,aesthetic,utility,face
+--dedupe
+```
 
-- **Variance of the Laplacian conflates focus with contrast.** A correctly
-  focused but very flat/dark/foggy image scores low and may be labelled
-  "blurry". Read the `contrast`/`brightness` columns before trusting the label.
-- **Noise can inflate sharpness**, so a grainy image won't be flagged as blurry
-  — that's why noise is measured separately on a native-resolution crop.
-- **The aesthetic score is subjective**; it is used as a *review* signal, not a
-  hard delete trigger.
-- **Near-duplicate clustering uses single-link grouping**, so too high a
-  `--dedupe-threshold` causes chaining (distinct shots merged into one cluster).
-  Keep it low and review large clusters.
-- This is a triage tool, not an infallible judge. Always review before deleting,
-  and keep a backup.
+**Review:** each run gathers candidates into worst-first **albums inside
+Photos.app** (`--albums-by signal` for one album per defect), which you browse
+full-resolution and delete with native shortcuts.
 
 ## Documentation
 
-- [docs/metrics.md](docs/metrics.md) — what photocull measures and how to tune thresholds.
+- [docs/metrics.md](docs/metrics.md) — what photocull measures, the detection signals, and tuning.
 - [docs/options.md](docs/options.md) — full command-line reference.
 - [docs/dedupe.md](docs/dedupe.md) — near-duplicate detection in depth.
 - [docs/review.md](docs/review.md) — the review gallery and its security model.
 - [docs/photos.md](docs/photos.md) — analysing the Apple Photos library directly.
 - [docs/cache.md](docs/cache.md) — the on-disk result cache.
 - [docs/performance.md](docs/performance.md) — performance and worker tuning.
+- [docs/limitations.md](docs/limitations.md) — known limitations and caveats.
 
 ## License
 

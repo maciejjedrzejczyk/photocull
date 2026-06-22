@@ -16,6 +16,11 @@ dist/
 photo_quality_report.csv
 *_report.csv
 
+# Personal Photos scan config — keep the tracked template (photos.args.example)
+# but never commit a real one.
+photos.args
+run.log
+
 # Never commit photos / image data. Image files are ignored at the repo root
 # (where stray scans/outputs land). Docs screenshots under assets/ or docs/
 # are still allowed, or force-add with `git add -f`.

@@ -1,0 +1,49 @@
+# photocull (Photos) scan options — one option per line, '#' starts a comment.
+#
+# Copy this file to your working folder as `photos.args` and edit it. The app
+# reads it on launch (the working folder is the one you pick, or $PHOTOCULL_HOME,
+# or ~/.photocull).
+#
+# NOTE: comments must be on their OWN line; the launcher only strips whole-line
+# comments, so a '#' after a value would be passed to the program by mistake.
+
+# ---- Subset: what to scan (uncomment one or combine) ----
+--smart-album recently-added
+# --album "Iceland 2024"
+# --since 2025-01-01
+# --until 2025-12-31
+# --limit 1000
+# --include-favorites          # favourites are excluded by default
+
+# ---- Detection signals: which kinds of photos to flag ----
+# All eight possible signals are enabled below. To narrow detection, drop names
+# from this list or add an --exclude-signals line.
+#   blur      -> Blurry            dark      -> Too dark
+#   contrast  -> Low contrast      noise     -> Noisy
+#   exposure  -> Bad exposure      aesthetic -> Low aesthetic (Vision)
+#   utility   -> Utility/screenshot (Vision)
+#   face      -> Poor face capture  (Vision)
+--signals blur,dark,contrast,noise,exposure,aesthetic,utility,face
+# --exclude-signals aesthetic,utility
+
+# ---- Signal thresholds (defaults shown; uncomment a line to override) ----
+# --blur 100.0
+# --blur-hard 35.0
+# --dark 50.0
+# --dark-hard 25.0
+# --contrast 18.0
+# --noise 7.0
+# --aesthetic -0.10
+# --face 0.30
+
+# ---- Near-duplicates / bursts ----
+--dedupe
+# --dedupe-threshold 0.3         # lower = stricter / safer
+
+# ---- Review albums ----
+--albums-by signal               # one album per defect; use 'tier' for grouped albums
+# --album-prefix photocull
+# --replace-albums               # delete previous photocull albums first
+
+# ---- iCloud ----
+# --no-download                  # skip (don't download) iCloud-only originals

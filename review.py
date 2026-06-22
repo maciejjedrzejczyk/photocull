@@ -45,6 +45,8 @@ import objc
 import Quartz
 from Foundation import NSURL, NSMutableData, NSFileManager
 
+from photo_quality import REASON_TO_SIGNAL, SIGNALS
+
 
 # --------------------------------------------------------------------------
 # Global state (set up in main, read by the request handler)
@@ -114,17 +116,19 @@ def cached_jpeg(path: str, max_px: int, quality: float = 0.85) -> bytes | None:
 
 # --------------------------------------------------------------------------
 # Destructive actions (move to Trash / quarantine). Never permanent-deletes.
+# Each returns (ok, new_location, error) so a move can be undone (restore).
 # --------------------------------------------------------------------------
-def move_to_trash(path: str) -> tuple[bool, str]:
+def move_to_trash(path: str) -> tuple[bool, str, str]:
     fm = NSFileManager.defaultManager()
-    ok, _new, err = fm.trashItemAtURL_resultingItemURL_error_(
+    ok, new, err = fm.trashItemAtURL_resultingItemURL_error_(
         NSURL.fileURLWithPath_(path), None, None)
-    return bool(ok), ("" if ok else str(err))
+    new_path = new.path() if (ok and new is not None) else ""
+    return bool(ok), new_path, ("" if ok else str(err))
 
 
-def move_to_quarantine(path: str) -> tuple[bool, str]:
+def move_to_quarantine(path: str) -> tuple[bool, str, str]:
     if QUARANTINE is None:
-        return False, "no quarantine folder configured"
+        return False, "", "no quarantine folder configured"
     src = Path(path)
     rel = None
     for root in QROOTS:
@@ -143,6 +147,19 @@ def move_to_quarantine(path: str) -> tuple[bool, str]:
     try:
         import shutil
         shutil.move(str(src), str(target))
+        return True, str(target), ""
+    except OSError as e:
+        return False, "", str(e)
+
+
+def restore_from(src: str, dest: str) -> tuple[bool, str]:
+    """Move a previously trashed/quarantined file back to its original path."""
+    if not src or not Path(src).exists():
+        return False, "the moved file is no longer where we left it"
+    try:
+        import shutil
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(src, dest)
         return True, ""
     except OSError as e:
         return False, str(e)
@@ -220,7 +237,10 @@ class Handler(BaseHTTPRequestHandler):
                                   "token": TOKEN,
                                   "quarantine": bool(QUARANTINE),
                                   "thumb_size": THUMB_SIZE,
-                                  "thumb_quality": THUMB_QUALITY})
+                                  "thumb_quality": THUMB_QUALITY,
+                                  "reason_signal": REASON_TO_SIGNAL,
+                                  "signal_labels": {k: s.label
+                                                    for k, s in SIGNALS.items()}})
             return self._send(200, payload, "application/json")
 
         if route in ("/thumb", "/full"):
@@ -258,7 +278,7 @@ class Handler(BaseHTTPRequestHandler):
 
         action = body.get("action")
         ids = body.get("ids", [])
-        if action not in ("trash", "quarantine"):
+        if action not in ("trash", "quarantine", "restore"):
             return self._send(400, '{"error":"bad action"}', "application/json")
 
         results = []
@@ -269,16 +289,34 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             it = ITEMS[i]
             p = it["abspath"]
+
+            if action == "restore":
+                # Undo a previous trash/quarantine for this item.
+                if not it.get("removed"):
+                    results.append({"id": i, "ok": False, "error": "not removed"})
+                    continue
+                ok, err = restore_from(it.get("moved_to", ""), p)
+                if ok:
+                    with _LOCK:
+                        it["removed"] = False
+                        it["moved_to"] = ""
+                        if Path(p).exists():
+                            ALLOWED.add(p)
+                    freed -= int(it.get("file_bytes") or 0)
+                results.append({"id": i, "ok": ok, "error": err})
+                continue
+
             if p not in ALLOWED or it.get("removed"):
                 results.append({"id": i, "ok": False, "error": "not allowed"})
                 continue
             if action == "trash":
-                ok, err = move_to_trash(p)
+                ok, moved_to, err = move_to_trash(p)
             else:
-                ok, err = move_to_quarantine(p)
+                ok, moved_to, err = move_to_quarantine(p)
             if ok:
                 with _LOCK:
                     it["removed"] = True
+                    it["moved_to"] = moved_to
                     ALLOWED.discard(p)
                 freed += int(it.get("file_bytes") or 0)
             results.append({"id": i, "ok": ok, "error": err})
@@ -330,6 +368,7 @@ def load_csv(path: Path) -> None:
                 "file_bytes": fb,
                 "exists": exists,
                 "removed": False,
+                "moved_to": "",
             }
             ITEMS.append(it)
             if exists:
@@ -358,11 +397,17 @@ INDEX_HTML = r"""<!doctype html>
   button.primary { background:#3b82f6; border-color:#3b82f6; }
   button.danger { background:#b4452f; border-color:#b4452f; }
   button:disabled { opacity:.45; cursor:not-allowed; }
+  .chip { cursor:pointer; user-select:none; padding:3px 9px; border:1px solid var(--line); border-radius:13px; font-size:12px; background:#20242c; }
+  .chip.on { background:#2d4a73; border-color:#3b82f6; color:#dcebff; }
   .bar2 { margin-top:8px; color:var(--muted); }
   #grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(var(--tile,190px),1fr)); gap:12px; padding:14px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:9px; overflow:hidden; position:relative; }
   .card.keeper { border-color:#caa23a; }
-  .card.sel { outline:2px solid #3b82f6; }
+  .card.rej { outline:2px solid #e0593c; box-shadow:0 0 0 3px rgba(224,89,60,.25); }
+  .card.rej .thumbwrap img { opacity:.55; }
+  .card.kept { outline:2px solid #36a85a; }
+  .clusterhead { grid-column:1/-1; display:flex; gap:12px; align-items:center; padding:8px 4px 2px; border-top:1px solid var(--line); color:var(--muted); }
+  .clusterhead b { color:var(--txt); }
   .thumbwrap { aspect-ratio:1/1; background:#0c0d10; display:flex; align-items:center; justify-content:center; cursor:zoom-in; overflow:hidden; }
   .thumbwrap img { width:100%; height:100%; object-fit:cover; display:block; }
   .meta { padding:7px 9px; font-size:12px; }
@@ -374,14 +419,19 @@ INDEX_HTML = r"""<!doctype html>
   .chk { position:absolute; top:8px; left:8px; width:20px; height:20px; z-index:2; cursor:pointer; }
   .kp { position:absolute; top:7px; right:8px; background:#caa23a; color:#1a1400; border-radius:4px; padding:0 5px; font-size:10px; font-weight:700; }
   #pager { display:flex; gap:8px; align-items:center; justify-content:center; padding:14px; }
-  /* lightbox */
-  #lb { position:fixed; inset:0; background:rgba(0,0,0,.92); display:none; z-index:20; flex-direction:column; }
-  #lb.show { display:flex; }
-  #lbimg { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; }
-  #lbimg img { max-width:96vw; max-height:82vh; object-fit:contain; }
-  #lbbar { padding:10px 16px; background:var(--panel); border-top:1px solid var(--line); display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
-  .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:34px; padding:6px 16px; background:rgba(0,0,0,.4); }
-  #lbprev{left:6px;} #lbnext{right:6px;}
+  /* focus mode */
+  #focus { position:fixed; inset:0; background:rgba(0,0,0,.94); display:none; z-index:20; flex-direction:column; }
+  #focus.show { display:flex; }
+  #fwrap { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; overflow:auto; }
+  #fpic { max-width:96vw; max-height:84vh; object-fit:contain; transition:filter .1s; }
+  #fpic.zoom { max-width:none; max-height:none; cursor:move; }
+  #fbar { padding:10px 16px; background:var(--panel); border-top:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  #fbar .tag { padding:2px 8px; border-radius:6px; font-weight:600; }
+  .tag-rej{ background:#7a2618; color:#ffd9cf; } .tag-keep{ background:#244a2c; color:#cfeccf; }
+  .nav { position:absolute; top:50%; transform:translateY(-50%); font-size:34px; padding:6px 16px; background:rgba(0,0,0,.4); cursor:pointer; user-select:none; }
+  #fprev{left:6px;} #fnext{right:6px;}
+  kbd { background:#2a2f39; border:1px solid var(--line); border-radius:4px; padding:0 5px; font-size:11px; }
+  .hint { color:var(--muted); font-size:12px; }
   .toast { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:#262a33; border:1px solid var(--line); padding:10px 16px; border-radius:8px; z-index:30; display:none; }
 </style></head>
 <body>
@@ -389,11 +439,11 @@ INDEX_HTML = r"""<!doctype html>
   <div class="row">
     <h1>photocull review</h1>
     <span id="filters" class="row"></span>
-    <input id="q" type="search" placeholder="filter by filename…" style="width:180px">
+    <input id="q" type="search" placeholder="filter by filename…" style="width:160px">
     <label class="f">sort
       <select id="sort">
-        <option value="recommendation">tier</option>
-        <option value="cluster_id">cluster</option>
+        <option value="recommendation">tier (worst first)</option>
+        <option value="cluster_id">cluster (compare)</option>
         <option value="sharpness">sharpness</option>
         <option value="brightness">brightness</option>
         <option value="aesthetic">aesthetic</option>
@@ -403,59 +453,77 @@ INDEX_HTML = r"""<!doctype html>
     </label>
     <label class="f">size
       <select id="thumbsize">
-        <option value="320">XS</option>
-        <option value="480">S</option>
-        <option value="640">M</option>
-        <option value="900">L</option>
-        <option value="1200">XL</option>
-        <option value="1600">XXL</option>
+        <option value="320">XS</option><option value="480">S</option>
+        <option value="640">M</option><option value="900">L</option>
+        <option value="1200">XL</option><option value="1600">XXL</option>
       </select>
     </label>
     <label class="f">quality
       <select id="thumbq">
-        <option value="0.6">low</option>
-        <option value="0.75">medium</option>
-        <option value="0.85">high</option>
-        <option value="0.95">max</option>
+        <option value="0.6">low</option><option value="0.75">medium</option>
+        <option value="0.85">high</option><option value="0.95">max</option>
       </select>
     </label>
-    <div class="spacer"></div>
-    <button id="selpage">Select page</button>
-    <button id="selnone">Clear</button>
-    <button id="btnTrash" class="danger" disabled>Move to Trash</button>
-    <button id="btnQuar" class="primary" disabled>Quarantine</button>
   </div>
-  <div class="bar2 row"><span id="stat"></span><span class="spacer"></span><span id="selstat"></span></div>
+  <div class="row" style="margin-top:8px">
+    <span class="muted" style="font-size:12px">signals:</span>
+    <span id="sigfilters" class="row"></span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="focusBtn">▶ Focus mode</button>
+    <button id="selpage">Mark page ✗</button>
+    <button id="clearmarks">Clear marks</button>
+    <div class="spacer"></div>
+    <button id="btnTrash" class="danger" disabled>Commit ✗ → Trash</button>
+    <button id="btnQuar" class="primary" disabled>Commit ✗ → Quarantine</button>
+    <button id="btnUndo" disabled>↶ Undo commit</button>
+  </div>
+  <div class="bar2 row"><span id="stat"></span><span class="spacer"></span><span id="markstat"></span></div>
 </header>
 
 <div id="grid"></div>
 <div id="pager"></div>
 
-<div id="lb">
-  <div id="lbimg"><img id="lbpic" alt=""></div>
-  <div id="lbprev" class="nav" style="cursor:pointer">‹</div>
-  <div id="lbnext" class="nav" style="cursor:pointer">›</div>
-  <div id="lbbar">
-    <b id="lbname"></b><span id="lbmeta" class="muted"></span>
+<div id="focus">
+  <div id="fwrap"><img id="fpic" alt=""></div>
+  <div id="fprev" class="nav">‹</div>
+  <div id="fnext" class="nav">›</div>
+  <div id="fbar">
+    <b id="fname"></b><span id="fmeta" class="muted"></span>
+    <span id="ftag" class="tag"></span>
     <span class="spacer"></span>
-    <button id="lbtrash" class="danger">Trash this</button>
-    <button id="lbclose">Close</button>
+    <span id="fpos" class="muted"></span>
+    <button id="fReject" class="danger">✗ Reject</button>
+    <button id="fKeep" class="primary">✓ Keep</button>
+    <button id="fZoom">Zoom</button>
+    <button id="fBright">Brighten</button>
+    <button id="fClose">Close</button>
+  </div>
+  <div class="hint" style="padding:0 16px 8px">
+    <kbd>←</kbd>/<kbd>→</kbd> move · <kbd>X</kbd>/<kbd>⌫</kbd> reject &amp; next ·
+    <kbd>K</kbd>/<kbd>↵</kbd> keep &amp; next · <kbd>U</kbd> unmark ·
+    <kbd>Z</kbd> zoom · <kbd>B</kbd> brighten · <kbd>Esc</kbd> close
   </div>
 </div>
 <div id="toast" class="toast"></div>
 
 <script>
 const TOKEN = "__TOKEN__";
-let ALL = [], HAS_QUAR = false, sel = new Set(), page = 0;
+let ALL = [], HAS_QUAR = false, page = 0;
 let thumbSize = 640, thumbQ = 0.85;
+let REASON_SIGNAL = {}, SIGNAL_LABELS = {};
+const mark = new Map();          // id -> 'reject' | 'keep'
+let lastCommitted = [];          // ids from the last commit, for undo
 const PAGE = 120;
 const tiers = ["delete","duplicate","review","keep"];
 const tierOn = {delete:true, duplicate:true, review:true, keep:false};
+const sigOn = new Set();         // active signal filters (empty = no filter)
+let lastClickId = null;          // for shift-range marking
 const $ = s => document.querySelector(s);
 const fmtBytes = n => { n=+n||0; const u=["B","KB","MB","GB","TB"]; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++;} return n.toFixed(1)+" "+u[i]; };
 const thumbURL = id => `/thumb?i=${id}&size=${thumbSize}&q=${thumbQ}`;
+
 function applyTile(){
-  // Display tile ~ half the fetched resolution (retina-friendly), clamped.
   const t = Math.max(150, Math.min(560, Math.round(thumbSize/2)));
   document.documentElement.style.setProperty("--tile", t + "px");
 }
@@ -467,30 +535,83 @@ function savePrefs(){
   localStorage.setItem("pc_thumb_size", thumbSize);
   localStorage.setItem("pc_thumb_q", thumbQ);
 }
-
+function signalsOf(x){
+  const out = new Set();
+  (x.reasons||"").split(";").forEach(r=>{ r=r.trim(); const s=REASON_SIGNAL[r]; if(s) out.add(s); });
+  return out;
+}
 function buildFilters(){
   const c = $("#filters"); c.innerHTML="";
   tiers.forEach(t=>{
-    const n = ALL.filter(x=>x.recommendation===t).length;
+    const n = ALL.filter(x=>!x.removed && x.recommendation===t).length;
     const l = document.createElement("label"); l.className="f";
     l.innerHTML = `<input type="checkbox" ${tierOn[t]?"checked":""} data-t="${t}"> ${t} <span class="muted">(${n})</span>`;
     l.querySelector("input").onchange = e => { tierOn[t]=e.target.checked; page=0; render(); };
     c.appendChild(l);
   });
 }
+function buildSignalFilters(){
+  const c = $("#sigfilters"); c.innerHTML="";
+  const present = {};
+  ALL.forEach(x=>{ if(!x.removed) signalsOf(x).forEach(s=>{ present[s]=(present[s]||0)+1; }); });
+  const keys = Object.keys(SIGNAL_LABELS).filter(k=>present[k]);
+  if(!keys.length){ c.innerHTML = '<span class="muted" style="font-size:12px">none</span>'; return; }
+  keys.forEach(k=>{
+    const el = document.createElement("span");
+    el.className = "chip" + (sigOn.has(k)?" on":"");
+    el.textContent = `${SIGNAL_LABELS[k]} (${present[k]})`;
+    el.onclick = () => { sigOn.has(k)?sigOn.delete(k):sigOn.add(k); el.classList.toggle("on"); page=0; render(); };
+    c.appendChild(el);
+  });
+}
 function visible(){
   const q = $("#q").value.trim().toLowerCase();
   let v = ALL.filter(x=>!x.removed && tierOn[x.recommendation] && (!q || x.name.toLowerCase().includes(q)));
+  if(sigOn.size){
+    v = v.filter(x=>{ const s=signalsOf(x); for(const k of sigOn) if(s.has(k)) return true; return false; });
+  }
   const s = $("#sort").value;
-  const num = ["sharpness","brightness","contrast","noise","aesthetic","file_bytes","cluster_id"];
+  const num = ["sharpness","brightness","contrast","noise","aesthetic","file_bytes"];
   v.sort((a,b)=>{
     if(s==="recommendation"){ const o={delete:0,duplicate:1,review:2,keep:3};
       return (o[a.recommendation]-o[b.recommendation]) || ((+a.sharpness||0)-(+b.sharpness||0)); }
+    if(s==="cluster_id"){ return ((+a.cluster_id)-(+b.cluster_id)) || ((a.is_keeper==="True"?0:1)-(b.is_keeper==="True"?0:1)) || ((+a.sharpness||0)-(+b.sharpness||0)); }
     if(s==="name") return a.name.localeCompare(b.name);
     if(num.includes(s)) return (parseFloat(a[s])||0)-(parseFloat(b[s])||0);
     return 0;
   });
   return v;
+}
+function isClusterKeeper(x){ return x.is_keeper==="True" && +x.cluster_size>1; }
+function inCluster(x){ return +x.cluster_size>1 && +x.cluster_id>=0; }
+
+function tileMarkClass(x){ const m=mark.get(x.id); return m==="reject"?" rej":(m==="keep"?" kept":""); }
+
+function makeCard(x){
+  const d = document.createElement("div");
+  d.className = "card" + (isClusterKeeper(x)?" keeper":"") + tileMarkClass(x);
+  d.dataset.id = x.id;
+  const clu = inCluster(x) ? `· cluster ${x.cluster_id} (${x.cluster_size})` : "";
+  const kp = isClusterKeeper(x) ? `<span class="kp">KEEP</span>`:"";
+  d.innerHTML = `
+    <input type="checkbox" class="chk" title="mark for deletion" ${mark.get(x.id)==="reject"?"checked":""}>
+    ${kp}
+    <div class="thumbwrap"><img loading="lazy" src="${thumbURL(x.id)}" alt=""></div>
+    <div class="meta">
+      <div class="name" title="${x.name}">${x.name}</div>
+      <div><span class="badge b-${x.recommendation}">${x.recommendation}</span>
+        <span class="muted">${fmtBytes(x.file_bytes)}</span></div>
+      <div class="muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.reasons||""} ${clu}</div>
+      <div class="muted">sharp ${x.sharpness||"–"} · aes ${x.aesthetic||"–"}</div>
+    </div>`;
+  const chk = d.querySelector(".chk");
+  chk.addEventListener("click", e => {
+    if(e.shiftKey && lastClickId!==null){ rangeMark(lastClickId, x.id); }
+    else { setMark(x.id, chk.checked ? "reject" : null); }
+    lastClickId = x.id; render();
+  });
+  d.querySelector(".thumbwrap").onclick = () => openFocus(x.id);
+  return d;
 }
 function render(){
   const v = visible();
@@ -498,29 +619,27 @@ function render(){
   if(page>=pages) page=pages-1;
   const slice = v.slice(page*PAGE,(page+1)*PAGE);
   const g = $("#grid"); g.innerHTML="";
+  const grouped = $("#sort").value==="cluster_id";
+  let curCluster = null;
   slice.forEach(x=>{
-    const d = document.createElement("div");
-    d.className = "card" + (x.is_keeper==="True"&&x.cluster_size&&+x.cluster_size>1?" keeper":"") + (sel.has(x.id)?" sel":"");
-    const clu = (x.cluster_size && +x.cluster_size>1) ? `· cluster ${x.cluster_id} (${x.cluster_size})` : "";
-    const kp = (x.is_keeper==="True"&&x.cluster_size&&+x.cluster_size>1) ? `<span class="kp">KEEP</span>`:"";
-    d.innerHTML = `
-      <input type="checkbox" class="chk" ${sel.has(x.id)?"checked":""}>
-      ${kp}
-      <div class="thumbwrap"><img loading="lazy" src="${thumbURL(x.id)}" alt=""></div>
-      <div class="meta">
-        <div class="name" title="${x.name}">${x.name}</div>
-        <div><span class="badge b-${x.recommendation}">${x.recommendation}</span>
-          <span class="muted">${fmtBytes(x.file_bytes)}</span></div>
-        <div class="muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${x.reasons||""} ${clu}</div>
-        <div class="muted">sharp ${x.sharpness||"–"} · aes ${x.aesthetic||"–"}</div>
-      </div>`;
-    d.querySelector(".chk").onchange = e => { e.target.checked?sel.add(x.id):sel.delete(x.id); d.classList.toggle("sel",e.target.checked); updateSel(); };
-    d.querySelector(".thumbwrap").onclick = () => openLB(x.id);
-    g.appendChild(d);
+    if(grouped && inCluster(x) && x.cluster_id!==curCluster){
+      curCluster = x.cluster_id;
+      const members = v.filter(y=>y.cluster_id===x.cluster_id);
+      const keeper = members.find(isClusterKeeper);
+      const h = document.createElement("div"); h.className="clusterhead";
+      h.innerHTML = `<b>Cluster ${x.cluster_id}</b> <span>${members.length} frames` +
+        (keeper?` · keeper: ${keeper.name}`:``) + `</span>`;
+      const btn = document.createElement("button");
+      btn.textContent = "Mark others ✗"; btn.className="danger";
+      btn.onclick = () => { members.forEach(y=>{ if(!isClusterKeeper(y)) setMark(y.id,"reject"); }); render(); };
+      h.appendChild(btn);
+      g.appendChild(h);
+    }
+    g.appendChild(makeCard(x));
   });
   $("#stat").textContent = `${v.length} shown · ${ALL.filter(x=>!x.removed).length} total`;
   renderPager(pages);
-  updateSel();
+  updateBars();
 }
 function renderPager(pages){
   const p = $("#pager"); p.innerHTML="";
@@ -530,55 +649,124 @@ function renderPager(pages){
   const s=document.createElement("span"); s.textContent=` page ${page+1} / ${pages} `; p.appendChild(s);
   p.appendChild(mk("next ›",()=>{page++;render();window.scrollTo(0,0);},page>=pages-1));
 }
-function updateSel(){
-  const ids=[...sel]; let bytes=0;
-  ids.forEach(i=>{const it=ALL[i]; if(it&&!it.removed) bytes+=(+it.file_bytes||0);});
-  $("#selstat").textContent = ids.length ? `${ids.length} selected · ${fmtBytes(bytes)}` : "";
-  $("#btnTrash").disabled = !ids.length;
-  $("#btnQuar").disabled = !ids.length || !HAS_QUAR;
+function setMark(id,val){ if(val) mark.set(id,val); else mark.delete(id); }
+function rangeMark(fromId, toId){
+  const order = visible().map(x=>x.id);
+  let a = order.indexOf(fromId), b = order.indexOf(toId);
+  if(a<0||b<0){ setMark(toId,"reject"); return; }
+  if(a>b){ [a,b]=[b,a]; }
+  for(let i=a;i<=b;i++) setMark(order[i],"reject");
 }
-// lightbox
-let lbList=[], lbPos=0;
-function openLB(id){ lbList=visible().map(x=>x.id); lbPos=lbList.indexOf(id); showLB(); }
-function showLB(){
-  const id=lbList[lbPos]; const x=ALL[id]; if(!x) return;
-  $("#lbpic").src = `/full?i=${id}`;
-  $("#lbname").textContent = x.name;
-  $("#lbmeta").textContent = ` ${x.recommendation} · ${x.reasons||""} · sharp ${x.sharpness||"–"} · bright ${x.brightness||"–"} · aes ${x.aesthetic||"–"} · ${fmtBytes(x.file_bytes)} · ${x.megapixels||"?"} MP`;
-  $("#lb").classList.add("show");
+function rejectIds(){ return [...mark].filter(([id,v])=>v==="reject" && !ALL[id].removed).map(([id])=>id); }
+function markCounts(){ let r=0,k=0; mark.forEach(v=>{ v==="reject"?r++:k++; }); return {r,k}; }
+function updateBars(){
+  const {r,k} = markCounts();
+  let bytes=0; rejectIds().forEach(i=>bytes+=(+ALL[i].file_bytes||0));
+  $("#markstat").textContent = r||k ? `${r} marked ✗ (${fmtBytes(bytes)})` + (k?` · ${k} kept`:"") : "";
+  $("#btnTrash").disabled = !r;
+  $("#btnQuar").disabled = !r || !HAS_QUAR;
+  $("#btnUndo").disabled = !lastCommitted.length;
 }
-function closeLB(){ $("#lb").classList.remove("show"); $("#lbpic").src=""; }
-$("#lbclose").onclick=closeLB;
-$("#lbprev").onclick=()=>{ if(lbPos>0){lbPos--;showLB();} };
-$("#lbnext").onclick=()=>{ if(lbPos<lbList.length-1){lbPos++;showLB();} };
-$("#lbtrash").onclick=async()=>{ const id=lbList[lbPos]; await act("trash",[id]); lbList.splice(lbPos,1); if(!lbList.length){closeLB();} else {if(lbPos>=lbList.length)lbPos--; showLB();} };
-document.onkeydown=e=>{ if(!$("#lb").classList.contains("show"))return;
-  if(e.key==="Escape")closeLB(); if(e.key==="ArrowLeft")$("#lbprev").click(); if(e.key==="ArrowRight")$("#lbnext").click(); };
 
-function toast(msg){ const t=$("#toast"); t.textContent=msg; t.style.display="block"; setTimeout(()=>t.style.display="none",3000); }
+// ---- focus mode ----
+let fList=[], fPos=0, fZoom=false, fBright=false;
+function metaLine(x){
+  return ` ${x.recommendation} · ${x.reasons||"–"} · sharp ${x.sharpness||"–"} · bright ${x.brightness||"–"} · aes ${x.aesthetic||"–"} · ${fmtBytes(x.file_bytes)} · ${x.megapixels||"?"} MP`;
+}
+function openFocus(id){
+  fList = visible().map(x=>x.id);
+  fPos = Math.max(0, fList.indexOf(id));
+  fZoom=false; fBright=false;
+  $("#focus").classList.add("show");
+  showFocus();
+}
+function showFocus(){
+  if(!fList.length){ closeFocus(); return; }
+  if(fPos<0) fPos=0; if(fPos>=fList.length) fPos=fList.length-1;
+  const id=fList[fPos], x=ALL[id]; if(!x){ closeFocus(); return; }
+  const img=$("#fpic");
+  img.src = `/full?i=${id}`;
+  img.className = fZoom?"zoom":"";
+  img.style.filter = fBright?"brightness(2.4) contrast(1.05)":"";
+  $("#fname").textContent = x.name;
+  $("#fmeta").textContent = metaLine(x);
+  const m = mark.get(id);
+  const tag=$("#ftag");
+  tag.textContent = m==="reject"?"✗ will delete":(m==="keep"?"✓ keep":"");
+  tag.className = "tag" + (m==="reject"?" tag-rej":(m==="keep"?" tag-keep":""));
+  $("#fpos").textContent = `${fPos+1} / ${fList.length}`;
+  $("#fZoom").textContent = fZoom?"Fit":"Zoom";
+  updateBars();
+}
+function focusStep(d){ fPos+=d; fZoom=false; showFocus(); }
+function focusMark(val){ const id=fList[fPos]; setMark(id, mark.get(id)===val?null:val); }
+function closeFocus(){ $("#focus").classList.remove("show"); $("#fpic").src=""; buildFilters(); buildSignalFilters(); render(); }
 
-async function act(action, ids){
-  if(!ids.length) return;
+$("#fprev").onclick=()=>focusStep(-1);
+$("#fnext").onclick=()=>focusStep(1);
+$("#fReject").onclick=()=>{ focusMark("reject"); if(fPos<fList.length-1)focusStep(1); else showFocus(); };
+$("#fKeep").onclick=()=>{ focusMark("keep"); if(fPos<fList.length-1)focusStep(1); else showFocus(); };
+$("#fZoom").onclick=()=>{ fZoom=!fZoom; showFocus(); };
+$("#fBright").onclick=()=>{ fBright=!fBright; showFocus(); };
+$("#fClose").onclick=closeFocus;
+$("#focusBtn").onclick=()=>{ const v=visible(); if(v.length) openFocus(v[0].id); };
+
+document.addEventListener("keydown", e=>{
+  if(!$("#focus").classList.contains("show")){
+    if((e.key==="f"||e.key==="F") && !/input|textarea|select/i.test(e.target.tagName)){
+      const v=visible(); if(v.length) openFocus(v[0].id);
+    }
+    return;
+  }
+  switch(e.key){
+    case "Escape": closeFocus(); break;
+    case "ArrowRight": e.preventDefault(); focusStep(1); break;
+    case "ArrowLeft": e.preventDefault(); focusStep(-1); break;
+    case "x": case "X": case "Delete": case "Backspace":
+      e.preventDefault(); focusMark("reject"); if(fPos<fList.length-1)focusStep(1); else showFocus(); break;
+    case "k": case "K": case "Enter": case " ":
+      e.preventDefault(); focusMark("keep"); if(fPos<fList.length-1)focusStep(1); else showFocus(); break;
+    case "u": case "U": e.preventDefault(); { const id=fList[fPos]; setMark(id,null); showFocus(); } break;
+    case "z": case "Z": e.preventDefault(); fZoom=!fZoom; showFocus(); break;
+    case "b": case "B": e.preventDefault(); fBright=!fBright; showFocus(); break;
+  }
+});
+
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.style.display="block"; clearTimeout(toast._t); toast._t=setTimeout(()=>t.style.display="none",3600); }
+async function post(b){
+  const r=await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TOKEN,...b})});
+  return r.json();
+}
+async function commit(action){
+  const ids=rejectIds();
+  if(!ids.length){ toast("Nothing marked for deletion."); return; }
   const verb = action==="trash" ? "Move to Trash" : "Move to Quarantine";
-  if(ids.length>1 && !confirm(`${verb}: ${ids.length} photo(s)?\n\nThis is recoverable (files are moved, not erased).`)) return;
-  const r = await fetch("/api/action",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({token:TOKEN,action,ids})});
-  const j = await r.json();
-  let ok=0; (j.results||[]).forEach(res=>{ if(res.ok){ ok++; ALL[res.id].removed=true; sel.delete(res.id); } });
-  toast(`${verb}: ${ok}/${ids.length} done · ${fmtBytes(j.freed||0)} freed`);
-  buildFilters(); render();
+  if(!confirm(`${verb}: ${ids.length} photo(s) marked ✗?\n\nRecoverable — files are moved, not erased. Use “Undo commit” right after to revert.`)) return;
+  const j=await post({action,ids});
+  let ok=0; (j.results||[]).forEach(res=>{ if(res.ok){ ok++; ALL[res.id].removed=true; mark.delete(res.id); } });
+  lastCommitted = (j.results||[]).filter(r=>r.ok).map(r=>r.id);
+  toast(`${verb}: ${ok}/${ids.length} done · ${fmtBytes(j.freed||0)} freed · Undo available`);
+  if(fList.length){ fList=fList.filter(id=>!ALL[id].removed); showFocus(); }
+  buildFilters(); buildSignalFilters(); render();
 }
-$("#btnTrash").onclick=()=>act("trash",[...sel].filter(i=>!ALL[i].removed));
-$("#btnQuar").onclick=()=>act("quarantine",[...sel].filter(i=>!ALL[i].removed));
-$("#selpage").onclick=()=>{ visible().slice(page*PAGE,(page+1)*PAGE).forEach(x=>sel.add(x.id)); render(); };
-$("#selnone").onclick=()=>{ sel.clear(); render(); };
+async function undoCommit(){
+  if(!lastCommitted.length){ return; }
+  const j=await post({action:"restore",ids:lastCommitted});
+  let ok=0; (j.results||[]).forEach(res=>{ if(res.ok){ ok++; ALL[res.id].removed=false; } });
+  toast(`Restored ${ok}/${lastCommitted.length} photo(s).`);
+  lastCommitted=[]; buildFilters(); buildSignalFilters(); render();
+}
+$("#btnTrash").onclick=()=>commit("trash");
+$("#btnQuar").onclick=()=>commit("quarantine");
+$("#btnUndo").onclick=undoCommit;
+$("#selpage").onclick=()=>{ visible().slice(page*PAGE,(page+1)*PAGE).forEach(x=>setMark(x.id,"reject")); render(); };
+$("#clearmarks").onclick=()=>{ mark.clear(); render(); };
 $("#q").oninput=()=>{page=0;render();};
 $("#sort").onchange=()=>{page=0;render();};
 $("#thumbsize").onchange=e=>{ thumbSize=+e.target.value; savePrefs(); applyTile(); render(); };
 $("#thumbq").onchange=e=>{ thumbQ=+e.target.value; savePrefs(); render(); };
 
 function syncThumbControls(){
-  // Snap the selects to the nearest available option for the current values.
   const sizes=[...$("#thumbsize").options].map(o=>+o.value);
   const near=sizes.reduce((a,b)=>Math.abs(b-thumbSize)<Math.abs(a-thumbSize)?b:a);
   $("#thumbsize").value=near; thumbSize=near;
@@ -590,11 +778,12 @@ function syncThumbControls(){
 (async function init(){
   const j = await (await fetch("/api/items")).json();
   ALL = j.items; HAS_QUAR = j.quarantine;
+  REASON_SIGNAL = j.reason_signal || {}; SIGNAL_LABELS = j.signal_labels || {};
   thumbSize = j.thumb_size || thumbSize; thumbQ = j.thumb_quality || thumbQ;
-  loadPrefs();              // a saved preference overrides the server default
+  loadPrefs();
   syncThumbControls();
   applyTile();
-  buildFilters(); render();
+  buildFilters(); buildSignalFilters(); render();
 })();
 </script>
 </body></html>

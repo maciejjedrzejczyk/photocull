@@ -9,18 +9,28 @@ gallery:
 ./review report.csv --port 8765 --quarantine ~/_rejects --root ~/Pictures
 ```
 
-In the browser you can:
+In the browser you work a **grid-first triage** flow:
 
-- **Filter by tier** (delete / duplicate / review / keep) and sort by any
-  metric — or by `cluster`, which groups near-duplicates with the keeper marked.
-- **Click any thumbnail** for a full-size view with all the metrics, and arrow
-  through the set.
-- **Select** photos individually or a whole page, see the total size selected,
-  and **bulk-move them to the macOS Trash** (recoverable) or to a quarantine
-  folder.
-- **Adjust thumbnail resolution and quality live** with the *size* and
-  *quality* dropdowns in the header — thumbnails re-fetch immediately and your
-  choice is remembered (per browser) across sessions.
+- **Worst-first grid (default).** The grid opens sorted by tier, worst first.
+  Filter by **tier** (delete / duplicate / review / keep) and by **signal**
+  (Blurry / Too dark / Noisy / …) using the chips, search by filename, and sort
+  by any metric or by **cluster**.
+- **Mark, don't delete (yet).** Tick a card (or use the keyboard in focus mode)
+  to mark it **✗ for deletion**; shift-click ticks a whole range. Marking is
+  reversible and moves nothing.
+- **Commit in a batch.** When you're happy, **Commit ✗ → Trash** (recoverable)
+  or **Commit ✗ → Quarantine** acts on everything marked at once. An **Undo
+  commit** button restores the last batch to its original location.
+- **Compare clusters.** Sort by **cluster** to see each near-duplicate group
+  together with its keeper highlighted; **Mark others ✗** rejects every frame in
+  the group except the keeper in one click.
+- **Focus mode (optional, keyboard-first).** Click a thumbnail or press
+  **Focus mode** for a full-screen, one-photo-at-a-time view with the reason and
+  metrics shown. Keys: `←`/`→` move, `X`/`⌫` reject &amp; next, `K`/`↵` keep &amp;
+  next, `U` unmark, `Z` zoom (check focus at full size), `B` brighten (judge
+  dark shots), `Esc` back to the grid.
+- **Tune thumbnails live** with the *size* and *quality* dropdowns; your choice
+  is remembered per browser.
 
 HEIC/HEIF are transcoded to JPEG on the fly so they display in any browser.
 Photos are read straight from their original locations — nothing is copied.
@@ -48,7 +58,8 @@ The server can move files, so it is locked down:
 - Destructive actions require a **per-session token** and a localhost `Host`
   header, so other browser tabs or websites can't drive deletions.
 - "Delete" moves files to the **macOS Trash** (recoverable) — there is no
-  permanent-delete path in this tool.
+  permanent-delete path in this tool. **Undo commit** moves the last committed
+  batch back from the Trash/quarantine to its original location.
 
 ## Reaching it from another machine
 

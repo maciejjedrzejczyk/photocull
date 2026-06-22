@@ -12,6 +12,10 @@ Full command-line reference for the scanner (`./scan` / `photo_quality.py`).
 | `--quarantine DIR`  | Move flagged files into `DIR` (preserving structure). Moves `delete` **and** `duplicate` tiers. |
 | `--include-review`  | Quarantine the `review` tier too.                            |
 | `--dry-run`         | With `--quarantine`, only print what would move.             |
+| **Detection signals** | Choose *which kinds of photos* get flagged. See [metrics.md](metrics.md#detection-signals). |
+| `--signals LIST`    | Comma-separated signals to **use** (default: all). Tokens: `blur`, `dark`, `contrast`, `noise`, `exposure`, `aesthetic`, `utility`, `face`. e.g. `--signals blur,dark`. |
+| `--exclude-signals LIST` | Comma-separated signals to **disable** (applied after `--signals`). e.g. `--exclude-signals aesthetic,utility`. |
+| `--face`            | Face capture quality below this is a poor portrait (default `0.30`); part of the `face` signal. |
 | **Near-duplicates** |                                                              |
 | `--dedupe`          | Cluster near-duplicate/burst photos and flag all but the best in each group. See [dedupe.md](dedupe.md). |
 | `--dedupe-threshold`| Feature-print L2 distance cutoff (default `0.3`; lower = stricter/safer). |
@@ -26,6 +30,7 @@ Full command-line reference for the scanner (`./scan` / `photo_quality.py`).
 | `--contrast`        | Luminance std below this is *low contrast* (default `18`).   |
 | `--noise`           | Noise sigma above this is *noisy* (default `7`).             |
 | `--aesthetic`       | Vision score below this is *low aesthetic* (default `-0.10`).|
+| `--face`            | Face capture quality below this is a *poor portrait* (default `0.30`). |
 
 The review server (`./review` / `review.py`) has its own options — see
 [review.md](review.md).

@@ -98,6 +98,90 @@ class Thresholds:
     noise: float = 7.0           # noise sigma above this -> "noisy"
     aesthetic: float = -0.10     # Vision overallScore below this -> "low_aesthetic"
     clip: float = 0.55           # >55% of pixels black or white -> bad exposure
+    face: float = 0.30           # face capture quality below this -> "low_face_quality"
+
+
+# --------------------------------------------------------------------------
+# Detection signals. Each named signal maps to one quality check in decide()
+# and the reason string(s) it can emit. Users select which signals to run from
+# the CLI (--signals / --exclude-signals) to control *what kinds of photos* get
+# flagged. To expand detection, add a new Signal here and a matching check in
+# decide(); everything else (CLI, album grouping, docs lookups) derives from
+# this registry.
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Signal:
+    key: str            # CLI token, e.g. "blur"
+    label: str          # human label (used for album names), e.g. "Blurry"
+    reasons: tuple      # reason string(s) this signal may emit
+    needs_vision: bool  # True if it depends on an Apple Vision metric
+
+
+SIGNALS: "dict[str, Signal]" = {
+    "blur":      Signal("blur",      "Blurry",             ("blurry", "very_blurry"), False),
+    "dark":      Signal("dark",      "Too dark",           ("dark", "very_dark"),     False),
+    "contrast":  Signal("contrast",  "Low contrast",       ("low_contrast",),         False),
+    "noise":     Signal("noise",     "Noisy",              ("noisy",),                False),
+    "exposure":  Signal("exposure",  "Bad exposure",       ("bad_exposure",),         False),
+    "aesthetic": Signal("aesthetic", "Low aesthetic",      ("low_aesthetic",),        True),
+    "utility":   Signal("utility",   "Utility/screenshot", ("utility",),              True),
+    "face":      Signal("face",      "Poor face capture",  ("low_face_quality",),     True),
+}
+
+# Reason string -> signal key (reverse lookup for album grouping etc.).
+REASON_TO_SIGNAL: "dict[str, str]" = {
+    r: key for key, sig in SIGNALS.items() for r in sig.reasons
+}
+
+
+def resolve_signals(include: "str | None", exclude: "str | None") -> "set[str]":
+    """Turn the --signals / --exclude-signals CLI strings into an enabled set.
+
+    `include` (comma-separated) restricts detection to those signals; when it
+    is omitted, every known signal starts enabled. `exclude` (comma-separated)
+    then removes signals from the set. Unknown names raise ValueError listing
+    the valid tokens.
+    """
+    known = set(SIGNALS)
+
+    def parse(s: "str | None") -> "list[str]":
+        return [tok.strip() for tok in (s or "").split(",") if tok.strip()]
+
+    def check(names: "list[str]") -> None:
+        bad = [n for n in names if n not in known]
+        if bad:
+            raise ValueError(
+                f"unknown signal(s): {', '.join(bad)}; "
+                f"valid signals are: {', '.join(SIGNALS)}")
+
+    inc = parse(include)
+    check(inc)
+    enabled = set(inc) if inc else set(known)
+
+    exc = parse(exclude)
+    check(exc)
+    enabled -= set(exc)
+    return enabled
+
+
+def add_signal_cli(group, d: "Thresholds") -> None:
+    """Register the shared signal-selection options on an argparse group.
+
+    Used by both the filesystem scanner and the Apple Photos source so the two
+    CLIs stay in lockstep.
+    """
+    group.add_argument(
+        "--signals", metavar="LIST",
+        help="comma-separated detection signals to USE (default: all). "
+             "Available: " + ", ".join(SIGNALS))
+    group.add_argument(
+        "--exclude-signals", metavar="LIST",
+        help="comma-separated detection signals to DISABLE (applied after "
+             "--signals)")
+    group.add_argument(
+        "--face", type=float, default=d.face,
+        help=f"face capture quality below this is a poor portrait "
+             f"(default {d.face}); part of the 'face' signal")
 
 
 @dataclass
@@ -290,29 +374,49 @@ def _fprint_bytes(obs) -> bytes | None:
 # --------------------------------------------------------------------------
 # Verdict
 # --------------------------------------------------------------------------
-def decide(m: Metrics, t: Thresholds) -> None:
+def decide(m: Metrics, t: Thresholds, enabled: "set[str] | None" = None) -> None:
+    """Turn metrics into reasons + a recommendation tier.
+
+    `enabled` is the set of active signal keys (see SIGNALS). A disabled signal
+    never fires: it contributes neither a reason nor weight to the verdict, so
+    callers can target specific kinds of defects. When `enabled` is None every
+    signal is active (the historical behaviour).
+    """
+    if enabled is None:
+        enabled = set(SIGNALS)
+    on = enabled.__contains__
     reasons: list[str] = []
 
-    very_blurry = m.sharpness < t.blur_hard
-    blurry = m.sharpness < t.blur
-    very_dark = m.brightness < t.dark_hard
-    dark = m.brightness < t.dark
-    bad_exposure = (m.black_frac >= t.clip) or (m.white_frac >= t.clip)
+    very_blurry = on("blur") and m.sharpness < t.blur_hard
+    blurry = on("blur") and m.sharpness < t.blur
+    very_dark = on("dark") and m.brightness < t.dark_hard
+    dark = on("dark") and m.brightness < t.dark
+    bad_exposure = on("exposure") and ((m.black_frac >= t.clip)
+                                       or (m.white_frac >= t.clip))
+    low_contrast = on("contrast") and m.contrast < t.contrast
+    noisy = on("noise") and m.noise > t.noise
+    low_aesthetic = on("aesthetic") and (m.aesthetic is not None
+                                         and m.aesthetic < t.aesthetic)
+    utility = on("utility") and bool(m.is_utility)
+    poor_face = on("face") and (m.face_quality is not None
+                                and m.face_quality < t.face)
 
     if blurry:
         reasons.append("very_blurry" if very_blurry else "blurry")
     if dark:
         reasons.append("very_dark" if very_dark else "dark")
-    if m.contrast < t.contrast:
+    if low_contrast:
         reasons.append("low_contrast")
-    if m.noise > t.noise:
+    if noisy:
         reasons.append("noisy")
     if bad_exposure:
         reasons.append("bad_exposure")
-    if m.aesthetic is not None and m.aesthetic < t.aesthetic:
+    if low_aesthetic:
         reasons.append("low_aesthetic")
-    if m.is_utility:
+    if utility:
         reasons.append("utility")
+    if poor_face:
+        reasons.append("low_face_quality")
 
     # Recommendation tiers.
     #   delete  - strong, objective defect: clearly blurry or clearly dark, or
@@ -322,8 +426,8 @@ def decide(m: Metrics, t: Thresholds) -> None:
     strong = (
         very_blurry
         or very_dark
-        or (blurry and (dark or bad_exposure or m.contrast < t.contrast))
-        or (m.face_quality is not None and m.face_quality < 0.30)
+        or (blurry and (dark or bad_exposure or low_contrast))
+        or poor_face
     )
     if strong:
         m.recommendation = "delete"
@@ -556,44 +660,31 @@ def _default_workers(use_vision: bool = True) -> int:
     return max(1, min(cpu, base))
 
 
-def _progress(done: int, total: int, t0: float) -> None:
-    if done % 50 == 0 or done == total:
-        rate = done / max(1e-6, time.time() - t0)
-        eta = (total - done) / rate if rate else 0
-        print(f"  {done}/{total}  ({rate:.1f}/s, eta {eta/60:.1f} min)",
-              file=sys.stderr)
+class ProgressReporter:
+    """Single progress channel shared by every source.
 
-
-def run_analysis(files, use_vision: bool, want_faces: bool, want_fprint: bool,
-                 workers: int, done0: int = 0, total0: int = 0) -> list[Metrics]:
-    """Analyse every file, serially or across worker processes.
-
-    Each image is wrapped in its own autorelease pool inside analyse(), so
-    memory stays flat regardless of library size. Parallelism is process-based
-    (not threads) to sidestep the GIL and pyobjc thread-safety concerns.
+    Renders a rate/ETA line to stderr (matching the historical format). A GUI
+    front-end can subclass and override ``_emit`` to also write a progress file
+    the UI polls, without the pipeline needing to know.
     """
-    task = partial(analyse, use_vision=use_vision, want_faces=want_faces,
-                   want_fprint=want_fprint)
-    results: list[Metrics] = []
-    t0 = time.time()
-    total = total0 or len(files)
-    done = done0
 
-    if workers <= 1 or len(files) <= 1:
-        for path in files:
-            results.append(task(path))
-            done += 1
-            _progress(done, total, t0)
-        return results
+    def __init__(self, total: int, label: str = "  ", stream=sys.stderr):
+        self.total = total
+        self.done = 0
+        self.label = label
+        self.stream = stream
+        self.t0 = time.time()
 
-    # chunksize batches files per IPC round-trip to cut overhead.
-    chunksize = max(1, min(16, len(files) // (workers * 8) or 1))
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for m in ex.map(task, files, chunksize=chunksize):
-            results.append(m)
-            done += 1
-            _progress(done, total, t0)
-    return results
+    def advance(self, n: int = 1) -> None:
+        self.done += n
+        if self.done % 50 == 0 or self.done >= self.total:
+            self._emit()
+
+    def _emit(self) -> None:
+        rate = self.done / max(1e-6, time.time() - self.t0)
+        eta = (self.total - self.done) / rate if rate else 0
+        print(f"{self.label}{self.done}/{self.total}  "
+              f"({rate:.1f}/s, eta {eta/60:.1f} min)", file=self.stream)
 
 
 # --------------------------------------------------------------------------
@@ -657,6 +748,33 @@ class Cache:
             size, mtime = stat_map.get(m.path, (m.file_bytes, 0))
             rows.append((
                 m.path, size, mtime, METRICS_VERSION,
+                m.width, m.height, m.megapixels, m.file_bytes,
+                m.sharpness, m.brightness, m.contrast, m.noise,
+                m.black_frac, m.white_frac, m.aesthetic,
+                None if m.is_utility is None else int(m.is_utility),
+                m.face_quality, m.fprint,
+            ))
+        if rows:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO cache VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows,
+            )
+            self.conn.commit()
+
+    def put_rows(self, rows_in) -> None:
+        """Store results keyed on an explicit cache id.
+
+        ``rows_in`` is an iterable of ``(cache_id, size, mtime, Metrics)``. The
+        cache id is the stable identity chosen by the Source (a file path for
+        the filesystem, a PhotoKit localIdentifier for Photos), so the cache no
+        longer has to borrow ``Metrics.path`` as its key.
+        """
+        rows = []
+        for cache_id, size, mtime, m in rows_in:
+            if m.error:  # don't cache failures; retry them next run
+                continue
+            rows.append((
+                cache_id, size, mtime, METRICS_VERSION,
                 m.width, m.height, m.megapixels, m.file_bytes,
                 m.sharpness, m.brightness, m.contrast, m.noise,
                 m.black_frac, m.white_frac, m.aesthetic,
@@ -766,6 +884,195 @@ def cluster_near_duplicates(results: list[Metrics], threshold: float) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Engine: a Source feeds items in, run_pipeline analyses/decides/dedupes them,
+# and Sinks consume the classified results. The filesystem and Apple Photos
+# front-ends differ ONLY in their Source (how items are enumerated/decoded) and
+# their Sinks (what happens to flagged items); everything between is shared.
+# --------------------------------------------------------------------------
+@dataclass
+class RunOptions:
+    thresholds: Thresholds
+    enabled_signals: set
+    use_vision: bool = True
+    want_faces: bool = True
+    want_fprint: bool = False
+    workers: int = 1
+    dedupe: bool = False
+    dedupe_threshold: float = 0.3
+
+
+class Source:
+    """Enumerates items and turns each into a Metrics. Subclasses supply the
+    medium-specific bits (file glob + CGImageSource, or PhotoKit fetch)."""
+
+    name = "source"
+    parallel = False  # may analyse across worker processes
+
+    def collect(self) -> list:
+        """Return opaque per-item references (paths, assets, …)."""
+        raise NotImplementedError
+
+    def cache_id(self, ref):
+        """Return ``(id, size, mtime)`` for the result cache, or None to skip
+        caching this item. ``id`` is the stable identity used as the cache key."""
+        return None
+
+    def hydrate_cached(self, m: Metrics, ref) -> None:
+        """Fix up a Metrics restored from cache so it carries this item's
+        display identity (path / asset id)."""
+
+    def analyse_one(self, ref, opts: RunOptions) -> Metrics:
+        """Analyse a single item in-process."""
+        raise NotImplementedError
+
+    def parallel_task(self, opts: RunOptions):
+        """Return a picklable callable ``ref -> Metrics`` for the process pool,
+        or None to force in-process analysis."""
+        return None
+
+
+class FilesystemSource(Source):
+    name = "files"
+    parallel = True
+
+    def __init__(self, paths, recursive: bool, skip_dir=None):
+        self.paths = paths
+        self.recursive = recursive
+        self.skip_dir = skip_dir
+        self.missing: list = []
+
+    def collect(self) -> list:
+        files, missing = collect_inputs(self.paths, self.recursive, self.skip_dir)
+        self.missing = missing
+        return files
+
+    def cache_id(self, ref):
+        try:
+            st = ref.stat()
+        except OSError:
+            return None
+        return (str(ref), st.st_size, st.st_mtime_ns)
+
+    def hydrate_cached(self, m: Metrics, ref) -> None:
+        m.path = str(ref)
+
+    def analyse_one(self, ref, opts: RunOptions) -> Metrics:
+        return analyse(ref, opts.use_vision, opts.want_faces, opts.want_fprint)
+
+    def parallel_task(self, opts: RunOptions):
+        return partial(analyse, use_vision=opts.use_vision,
+                       want_faces=opts.want_faces, want_fprint=opts.want_fprint)
+
+
+def run_pipeline(source: Source, opts: RunOptions, cache: "Cache | None",
+                 refs=None, progress_label: str = "  "):
+    """Analyse a source's items and return ``(results, dedupe_stats)``.
+
+    Owns the whole shared middle of the journey: the cache split, the (optional
+    parallel) analysis loop, the verdict, near-duplicate clustering, and the
+    worst-first sort. Source-specific behaviour is delegated entirely to the
+    ``source`` object; the result is identical whichever medium fed it.
+    """
+    if refs is None:
+        refs = source.collect()
+
+    cached: list[Metrics] = []
+    to_compute: list = []
+    compute_ids: list = []
+    for ref in refs:
+        cid = source.cache_id(ref)
+        m = None
+        if cid is not None and cache is not None:
+            id_, size, mtime = cid
+            m = cache.get(id_, size, mtime, opts.want_fprint)
+        if m is not None:
+            source.hydrate_cached(m, ref)
+            cached.append(m)
+        else:
+            to_compute.append(ref)
+            compute_ids.append(cid)
+
+    total = len(refs)
+    if cache is not None:
+        print(f"  {len(cached)} from cache, {len(to_compute)} to compute",
+              file=sys.stderr)
+    progress = ProgressReporter(total, progress_label)
+    progress.done = len(cached)
+
+    fresh: list[Metrics] = []
+    task = source.parallel_task(opts) if source.parallel else None
+    if task is not None and opts.workers > 1 and len(to_compute) > 1:
+        # chunksize batches items per IPC round-trip to cut overhead.
+        chunksize = max(1, min(16, len(to_compute) // (opts.workers * 8) or 1))
+        with ProcessPoolExecutor(max_workers=opts.workers) as ex:
+            for m in ex.map(task, to_compute, chunksize=chunksize):
+                fresh.append(m)
+                progress.advance()
+    else:
+        for ref in to_compute:
+            fresh.append(source.analyse_one(ref, opts))
+            progress.advance()
+
+    if cache is not None:
+        cache.put_rows((cid[0], cid[1], cid[2], m)
+                       for cid, m in zip(compute_ids, fresh) if cid is not None)
+
+    results = cached + fresh
+
+    # Verdict is recomputed for everything so current thresholds/signals always
+    # apply, even to cached rows.
+    for m in results:
+        if m.recommendation != "error":
+            decide(m, opts.thresholds, opts.enabled_signals)
+
+    dd_stats = None
+    if opts.dedupe:
+        print("Clustering near-duplicates...", file=sys.stderr)
+        dd_stats = cluster_near_duplicates(results, opts.dedupe_threshold)
+
+    order = {"delete": 0, "duplicate": 1, "review": 2, "keep": 3, "error": 4}
+    results.sort(key=lambda m: (order.get(m.recommendation, 9), m.sharpness))
+    return results, dd_stats
+
+
+# --------------------------------------------------------------------------
+# Sinks: consume the classified results. CSV + console summary are shared; the
+# medium-specific actions (quarantine move, Photos album curation) subclass too.
+# --------------------------------------------------------------------------
+class Sink:
+    def emit(self, results: list, dd_stats, source: Source) -> None:
+        raise NotImplementedError
+
+
+class CsvReportSink(Sink):
+    def __init__(self, out_path):
+        self.out_path = out_path
+
+    def emit(self, results, dd_stats, source) -> None:
+        write_csv(results, self.out_path)
+        print(f"\nWrote report: {self.out_path}", file=sys.stderr)
+
+
+class ConsoleSummarySink(Sink):
+    def emit(self, results, dd_stats, source) -> None:
+        print_summary(results, dd_stats)
+
+
+class QuarantineSink(Sink):
+    def __init__(self, dest, tiers, roots, dry_run):
+        self.dest = dest
+        self.tiers = tiers
+        self.roots = roots
+        self.dry_run = dry_run
+
+    def emit(self, results, dd_stats, source) -> None:
+        quarantine(results, self.dest, self.tiers, self.roots, self.dry_run)
+        if not self.dry_run:
+            print("Files were MOVED (not deleted). Review them, then delete "
+                  "manually when you're sure.", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="photocull",
@@ -819,6 +1126,10 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--aesthetic", type=float, default=d.aesthetic,
                    help=f"Vision score below this is low-aesthetic (default {d.aesthetic})")
 
+    s = p.add_argument_group(
+        "detection signals (choose which kinds of photos to flag)")
+    add_signal_cli(s, d)
+
     q = p.add_argument_group("quarantine (optional, moves files; never deletes)")
     q.add_argument("--quarantine", type=Path, metavar="DIR",
                    help="move flagged files into DIR for review")
@@ -834,21 +1145,39 @@ def main(argv=None) -> int:
     t = Thresholds(
         blur=args.blur, blur_hard=args.blur_hard, dark=args.dark,
         dark_hard=args.dark_hard, contrast=args.contrast, noise=args.noise,
-        aesthetic=args.aesthetic,
+        aesthetic=args.aesthetic, face=args.face,
     )
 
-    skip_dir = args.quarantine if args.quarantine else None
-    files, missing = collect_inputs(args.paths, args.recursive, skip_dir)
+    try:
+        enabled_signals = resolve_signals(args.signals, args.exclude_signals)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if not enabled_signals:
+        print("error: no detection signals enabled (check --signals / "
+              "--exclude-signals).", file=sys.stderr)
+        return 2
 
-    for p in missing:
+    skip_dir = args.quarantine if args.quarantine else None
+    source = FilesystemSource(args.paths, args.recursive, skip_dir)
+    files = source.collect()
+
+    for p in source.missing:
         print(f"skip: {p} (not found)", file=sys.stderr)
     if not files:
         print("no image files to process", file=sys.stderr)
         return 1
 
     use_vision = not args.no_vision
-    want_faces = use_vision and not args.no_faces
+    want_faces = use_vision and not args.no_faces and ("face" in enabled_signals)
     want_fprint = args.dedupe and use_vision
+
+    if not use_vision:
+        vis_on = [s for s in SIGNALS if s in enabled_signals
+                  and SIGNALS[s].needs_vision]
+        if vis_on:
+            print(f"note: signal(s) {', '.join(vis_on)} need Vision; "
+                  "they won't fire under --no-vision.", file=sys.stderr)
 
     if args.dedupe and not use_vision:
         print("note: --dedupe needs Vision; ignoring --no-vision for it.",
@@ -865,7 +1194,6 @@ def main(argv=None) -> int:
         workers = max(1, args.workers)
         worker_note = f"{workers} worker(s)"
 
-    # --- cache split: reuse unchanged files, only compute the rest ----------
     cache = None
     if not args.no_cache:
         try:
@@ -874,66 +1202,26 @@ def main(argv=None) -> int:
             print(f"warning: could not open cache {args.cache}: {e}",
                   file=sys.stderr)
 
-    stat_map: dict[str, tuple[int, int]] = {}
-    cached: list[Metrics] = []
-    to_compute: list[Path] = []
-    for f in files:
-        sp = str(f)
-        try:
-            st = f.stat()
-            stat_map[sp] = (st.st_size, st.st_mtime_ns)
-        except OSError:
-            to_compute.append(f)
-            continue
-        m = (cache.get(sp, st.st_size, st.st_mtime_ns, want_fprint)
-             if cache else None)
-        if m is not None:
-            cached.append(m)
-        else:
-            to_compute.append(f)
-
-    cache_note = (f" | {len(cached)} from cache, {len(to_compute)} to compute"
-                  if cache else "")
     classical_note = " (classical only)" if not use_vision else ""
     print(f"Analysing {len(files)} image(s) with {worker_note}"
-          f"{classical_note}{cache_note}...", file=sys.stderr)
+          f"{classical_note}...", file=sys.stderr)
 
-    fresh = run_analysis(to_compute, use_vision, want_faces, want_fprint,
-                         workers, done0=len(cached), total0=len(files))
-
+    opts = RunOptions(
+        thresholds=t, enabled_signals=enabled_signals, use_vision=use_vision,
+        want_faces=want_faces, want_fprint=want_fprint, workers=workers,
+        dedupe=args.dedupe, dedupe_threshold=args.dedupe_threshold,
+    )
+    results, dd_stats = run_pipeline(source, opts, cache, refs=files)
     if cache is not None:
-        cache.put_many(fresh, stat_map)
         cache.close()
 
-    results = cached + fresh
-
-    # Verdict is recomputed for everything so current thresholds always apply,
-    # even to cached rows.
-    for m in results:
-        if m.recommendation != "error":
-            decide(m, t)
-
-    # Near-duplicate clustering (overrides non-keepers to 'duplicate').
-    dd_stats = None
-    if args.dedupe:
-        print("Clustering near-duplicates...", file=sys.stderr)
-        dd_stats = cluster_near_duplicates(results, args.dedupe_threshold)
-
-    # Sort: worst/most-reclaimable first; blurriest first within a tier.
-    order = {"delete": 0, "duplicate": 1, "review": 2, "keep": 3, "error": 4}
-    results.sort(key=lambda m: (order.get(m.recommendation, 9), m.sharpness))
-
-    write_csv(results, args.output)
-    print(f"\nWrote report: {args.output}", file=sys.stderr)
-    print_summary(results, dd_stats)
-
+    sinks: list[Sink] = [CsvReportSink(args.output), ConsoleSummarySink()]
     if args.quarantine:
         roots = [p for p in args.paths if p.is_dir()]
         tiers = {"delete", "duplicate"} | ({"review"} if args.include_review else set())
-        quarantine(results, args.quarantine, tiers, roots, args.dry_run)
-        if not args.dry_run:
-            print("Files were MOVED (not deleted). Review them, then delete "
-                  "manually when you're sure.", file=sys.stderr)
+        sinks.append(QuarantineSink(args.quarantine, tiers, roots, args.dry_run))
+    for sink in sinks:
+        sink.emit(results, dd_stats, source)
 
     return 0
 
